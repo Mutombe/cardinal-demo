@@ -1,4 +1,4 @@
-import { lazy, Suspense, ReactNode } from 'react'
+import { lazy, Suspense, ReactNode, useEffect } from 'react'
 import { Routes, Route, Navigate } from 'react-router-dom'
 import { useAuthStore } from './stores/authStore'
 import { useOfflineSync } from './hooks/useOfflineSync'
@@ -114,6 +114,15 @@ function PublicPageLoader() {
   )
 }
 
+// The ERP is the staff portal. Visiting its root sends you to the PUBLIC
+// website homepage — staff log in deliberately via the website footer button.
+function HomeRedirect() {
+  useEffect(() => {
+    window.location.replace(import.meta.env.VITE_WEB_URL || 'http://localhost:5174')
+  }, [])
+  return null
+}
+
 function PrivateRoute({ children }: { children: React.ReactNode }) {
   const { isAuthenticated } = useAuthStore()
 
@@ -178,8 +187,8 @@ export default function App() {
     <>
     <OfflineBanner />
     <Routes>
-      {/* Public Routes — no ERP landing (that's the marketing site); root → login */}
-      <Route path="/" element={<Navigate to="/login" replace />} />
+      {/* Root → public website homepage (login is opt-in via the website footer). */}
+      <Route path="/" element={<HomeRedirect />} />
       <Route path="/learn" element={<Suspense fallback={<PublicPageLoader />}><Learn /></Suspense>} />
       <Route path="/login" element={<Suspense fallback={<PublicPageLoader />}><Login /></Suspense>} />
       <Route path="/register" element={<Suspense fallback={<PublicPageLoader />}><Register /></Suspense>} />

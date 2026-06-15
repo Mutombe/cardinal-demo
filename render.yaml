@@ -67,6 +67,8 @@ services:
     envVars:
       - key: VITE_API_URL
         value: "https://cardinal-backend.onrender.com"
+      - key: VITE_WEB_URL
+        value: "https://cardinal-web.onrender.com"
     routes:
       - type: rewrite
         source: /*
