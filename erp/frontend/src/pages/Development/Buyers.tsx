@@ -1,4 +1,5 @@
 import { useState } from 'react'
+import { useNavigate } from 'react-router-dom'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { Plus, Mail, Phone } from 'lucide-react'
 import { developmentApi } from '../../services/api'
@@ -9,6 +10,7 @@ import {
 
 export default function Buyers() {
   const qc = useQueryClient()
+  const navigate = useNavigate()
   const [search, setSearch] = useState('')
   const [open, setOpen] = useState(false)
   const [form, setForm] = useState({
@@ -71,7 +73,8 @@ export default function Buyers() {
                 <tr><Td className="py-10 text-center text-ink-muted">No buyers yet.</Td></tr>
               )}
               {buyers.map((b: any) => (
-                <tr key={b.id} className="transition hover:bg-cream-light">
+                <tr key={b.id} className="cursor-pointer transition hover:bg-cream-light"
+                  onClick={() => navigate(`/dashboard/buyers/${b.id}`)}>
                   <Td className="font-medium text-ink">{b.full_name}</Td>
                   <Td><code className="rounded bg-cream px-1.5 py-0.5 text-xs text-ink-soft">{b.code}</code></Td>
                   <Td>{b.national_id || '—'}</Td>

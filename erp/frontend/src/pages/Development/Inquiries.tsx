@@ -1,4 +1,5 @@
 import { useState } from 'react'
+import { useNavigate } from 'react-router-dom'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { Mail, Phone, Trash2, Globe } from 'lucide-react'
 import { developmentApi } from '../../services/api'
@@ -17,6 +18,7 @@ const STAGES = [
 
 export default function Inquiries() {
   const qc = useQueryClient()
+  const navigate = useNavigate()
   const [stage, setStage] = useState('')
   const [search, setSearch] = useState('')
 
@@ -119,7 +121,10 @@ export default function Inquiries() {
           <Card key={i.id} className="p-5">
             <div className="flex items-start justify-between">
               <div>
-                <h3 className="text-lg font-bold text-ink">{i.full_name}</h3>
+                <button onClick={() => navigate(`/dashboard/inquiries/${i.id}`)}
+                  className="text-left text-lg font-bold text-ink hover:text-primary-700 hover:underline">
+                  {i.full_name}
+                </button>
                 <p className="text-xs uppercase tracking-wider text-ink-muted">
                   {i.kind} · {i.development_name || 'General enquiry'}
                   {i.stand_number ? ` · Stand ${i.stand_number}` : ''}

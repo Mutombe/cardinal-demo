@@ -22,6 +22,11 @@ const Buyers = lazy(() => import('./pages/Development/Buyers'))
 const Agreements = lazy(() => import('./pages/Development/Agreements'))
 const Payments = lazy(() => import('./pages/Development/Payments'))
 const Inquiries = lazy(() => import('./pages/Development/Inquiries'))
+const StandDetail = lazy(() => import('./pages/Development/StandDetail'))
+const AgreementDetail = lazy(() => import('./pages/Development/AgreementDetail'))
+const BuyerDetail = lazy(() => import('./pages/Development/BuyerDetail'))
+const InquiryDetail = lazy(() => import('./pages/Development/InquiryDetail'))
+const PaymentDetail = lazy(() => import('./pages/Development/PaymentDetail'))
 const Landlords = lazy(() => import('./pages/Masterfile/Landlords'))
 const LandlordDetail = lazy(() => import('./pages/Masterfile/LandlordDetail'))
 const Properties = lazy(() => import('./pages/Masterfile/Properties'))
@@ -210,10 +215,15 @@ export default function App() {
         {/* Cardinal Property Development module + CMS */}
         <Route path="developments" element={<LazyPage><Developments /></LazyPage>} />
         <Route path="stands" element={<LazyPage><Stands /></LazyPage>} />
+        <Route path="stands/:id" element={<LazyPage><StandDetail /></LazyPage>} />
         <Route path="buyers" element={<LazyPage><Buyers /></LazyPage>} />
+        <Route path="buyers/:id" element={<LazyPage><BuyerDetail /></LazyPage>} />
         <Route path="agreements" element={<LazyPage><Agreements /></LazyPage>} />
+        <Route path="agreements/:id" element={<LazyPage><AgreementDetail /></LazyPage>} />
         <Route path="payments" element={<LazyPage><Payments /></LazyPage>} />
+        <Route path="payments/:id" element={<LazyPage><PaymentDetail /></LazyPage>} />
         <Route path="inquiries" element={<LazyPage><Inquiries /></LazyPage>} />
+        <Route path="inquiries/:id" element={<LazyPage><InquiryDetail /></LazyPage>} />
         {/* Legacy financial dashboard (trust-accounting KPIs) */}
         <Route path="financials" element={<LazyPage fallback={<SkeletonDashboard />}><Dashboard /></LazyPage>} />
         <Route path="landlords" element={<LazyPage><Landlords /></LazyPage>} />

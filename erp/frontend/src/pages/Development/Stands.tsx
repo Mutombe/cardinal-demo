@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { useSearchParams } from 'react-router-dom'
+import { useSearchParams, useNavigate } from 'react-router-dom'
 import { Plus } from 'lucide-react'
 import { developmentApi } from '../../services/api'
 import {
@@ -18,6 +18,7 @@ const STATUS_OPTIONS = [
 
 export default function Stands() {
   const qc = useQueryClient()
+  const navigate = useNavigate()
   const [params, setParams] = useSearchParams()
   const projectFilter = params.get('project') || ''
   const [statusFilter, setStatusFilter] = useState('')
@@ -137,7 +138,8 @@ export default function Stands() {
                 <tr><Td className="py-10 text-center text-ink-muted">No stands match.</Td></tr>
               )}
               {stands.map((s: any) => (
-                <tr key={s.id} className="transition hover:bg-cream-light">
+                <tr key={s.id} className="cursor-pointer transition hover:bg-cream-light"
+                  onClick={() => navigate(`/dashboard/stands/${s.id}`)}>
                   <Td className="font-medium text-ink">{s.stand_number}</Td>
                   <Td>{s.project_name}</Td>
                   <Td className="text-right tabular-nums">{s.size_sqm ? Number(s.size_sqm).toLocaleString() : '—'}</Td>

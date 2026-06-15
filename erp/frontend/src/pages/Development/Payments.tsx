@@ -1,4 +1,5 @@
 import { useState } from 'react'
+import { useNavigate } from 'react-router-dom'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { Plus, Receipt } from 'lucide-react'
 import { developmentApi } from '../../services/api'
@@ -17,6 +18,7 @@ const METHODS = [
 
 export default function Payments() {
   const qc = useQueryClient()
+  const navigate = useNavigate()
   const [search, setSearch] = useState('')
   const [open, setOpen] = useState(false)
   const [error, setError] = useState('')
@@ -96,7 +98,8 @@ export default function Payments() {
                 <tr><Td className="py-10 text-center text-ink-muted">No payments recorded yet.</Td></tr>
               )}
               {payments.map((p: any) => (
-                <tr key={p.id} className="transition hover:bg-cream-light">
+                <tr key={p.id} className="cursor-pointer transition hover:bg-cream-light"
+                  onClick={() => navigate(`/dashboard/payments/${p.id}`)}>
                   <Td className="font-medium text-ink">{p.payment_number}</Td>
                   <Td>{p.agreement_number}</Td>
                   <Td>{p.date}</Td>

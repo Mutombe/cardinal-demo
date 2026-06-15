@@ -1,4 +1,5 @@
 import { useMemo, useState } from 'react'
+import { useNavigate } from 'react-router-dom'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { Plus, CheckCircle2, ListChecks, ChevronDown, Trash2, Users, User } from 'lucide-react'
 import { developmentApi } from '../../services/api'
@@ -299,6 +300,7 @@ export default function Agreements() {
 }
 
 function AgreementRow({ a, expanded, onToggle, onActivate, onGenerate, activating, generating }: any) {
+  const navigate = useNavigate()
   const { data: instData } = useQuery({
     queryKey: ['dev-installments', a.id],
     queryFn: () => developmentApi.installments.list({ agreement: a.id, page_size: 100 }).then((r) => r.data),
@@ -314,7 +316,12 @@ function AgreementRow({ a, expanded, onToggle, onActivate, onGenerate, activatin
             <ChevronDown className={`h-4 w-4 transition ${expanded ? 'rotate-180' : ''}`} />
           </button>
         </Td>
-        <Td className="font-medium text-ink">{a.agreement_number}</Td>
+        <Td>
+          <button onClick={() => navigate(`/dashboard/agreements/${a.id}`)}
+            className="font-medium text-ink hover:text-primary-700 hover:underline">
+            {a.agreement_number}
+          </button>
+        </Td>
         <Td>{a.buyer_name || a.ownership?.label || '—'}</Td>
         <Td>{a.stand_number} <span className="text-xs text-ink-muted">· {a.project_name}</span></Td>
         <Td className="text-right tabular-nums">{money(a.sale_price, a.currency)}</Td>
