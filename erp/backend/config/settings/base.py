@@ -231,7 +231,22 @@ CORS_ALLOWED_ORIGINS = config(
     default='http://localhost:5173,http://127.0.0.1:5173,http://localhost:5174,http://127.0.0.1:5174,http://localhost:5175,http://127.0.0.1:5175,http://localhost:5176,http://127.0.0.1:5176,http://localhost:5177,http://127.0.0.1:5177,http://localhost:5178,http://127.0.0.1:5178,http://localhost:5179,http://127.0.0.1:5179,http://localhost:5180,http://127.0.0.1:5180',
     cast=Csv()
 )
+# Allow Cardinal's deployed frontends (Render + production domain) regardless of
+# which settings module is active. The ERP app and public site are cross-origin
+# to the API, so the browser needs these echoed on the preflight response.
+CORS_ALLOWED_ORIGIN_REGEXES = [
+    r"^https://[\w-]+\.onrender\.com$",
+    r"^https://([\w-]+\.)?cardinalproperties\.co\.zw$",
+]
 CORS_ALLOW_CREDENTIALS = True
+
+# Cross-origin unsafe requests (e.g. the login POST) must also pass Django's
+# CSRF origin check. Wildcards cover Render + the production domain.
+CSRF_TRUSTED_ORIGINS = config(
+    'CSRF_TRUSTED_ORIGINS',
+    default='https://*.onrender.com,https://*.cardinalproperties.co.zw,https://cardinalproperties.co.zw',
+    cast=Csv()
+)
 CORS_ALLOW_HEADERS = [
     'accept',
     'accept-encoding',
