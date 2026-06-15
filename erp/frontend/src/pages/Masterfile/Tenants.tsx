@@ -1,0 +1,1037 @@
+import { useState, useEffect, useRef } from 'react'
+import { useSearchParams, useNavigate } from 'react-router-dom'
+import { useQuery, useMutation, useQueryClient, keepPreviousData } from '@tanstack/react-query'
+import { Plus, Search, Users, Phone, Mail, Trash2, Loader2, Eye, X, FileText, Receipt, Building2, Calendar, DollarSign, AlertCircle, Home, Download, Wand2, Edit2 } from 'lucide-react'
+import { motion, AnimatePresence } from 'framer-motion'
+import { Upload, FileSpreadsheet } from 'lucide-react'
+import { tenantApi, unitApi, propertyApi, importsApi, landlordApi } from '../../services/api'
+import { useDebounce, formatCurrency, formatDate, cn } from '../../lib/utils'
+import { Pagination, EmptyState, Modal, SelectionCheckbox, BulkActionsBar, ConfirmDialog, SplitButton, Select, Tooltip } from '../../components/ui'
+import { AsyncSelect } from '../../components/ui/AsyncSelect'
+import { showToast, parseApiError } from '../../lib/toast'
+import { undoToast } from '../../lib/undoToast'
+import { useChainStore } from '../../stores/chainStore'
+import TenantForm from '../../components/forms/TenantForm'
+import { exportTableData } from '../../lib/export'
+import { useSelection } from '../../hooks/useSelection'
+import { useHotkeys } from '../../hooks/useHotkeys'
+import { usePrefetch } from '../../hooks/usePrefetch'
+import { PiUsersFour } from "react-icons/pi";
+import { TbUserSquareRounded } from "react-icons/tb";
+
+const PAGE_SIZE = 25
+
+// Filter options
+const tenantTypeOptions = [
+  { value: '', label: 'All Types' },
+  { value: 'individual', label: 'Individual' },
+  { value: 'company', label: 'Company' },
+]
+
+const leaseStatusOptions = [
+  { value: '', label: 'All Lease Status' },
+  { value: 'active', label: 'With Active Lease' },
+  { value: 'inactive', label: 'No Active Lease' },
+]
+
+export default function Tenants() {
+  const queryClient = useQueryClient()
+  const navigate = useNavigate()
+  const [searchParams, setSearchParams] = useSearchParams()
+  const [search, setSearch] = useState('')
+  const debouncedSearch = useDebounce(search, 300)
+  const [currentPage, setCurrentPage] = useState(1)
+  const [showForm, setShowForm] = useState(false)
+  const [editingId, setEditingId] = useState<number | null>(null)
+  const [deletingId, setDeletingId] = useState<number | null>(null)
+
+  // View mode: grid cards only
+
+  // Filter state
+  const [tenantTypeFilter, setTenantTypeFilter] = useState('')
+  const [leaseStatusFilter, setLeaseStatusFilter] = useState('')
+  // Landlord scope — seeded from ?landlord=<id> (deep-link from the
+  // Landlord detail page's "View Tenants" button).
+  const landlordFilter = searchParams.get('landlord') || ''
+
+  const selection = useSelection<number>({ clearOnChange: [debouncedSearch, tenantTypeFilter, leaseStatusFilter, landlordFilter] })
+  const prefetch = usePrefetch()
+
+  const searchInputRef = useRef<HTMLInputElement>(null)
+  useHotkeys([
+    { key: 'c', handler: () => setShowForm(true) },
+    { key: '/', handler: (e) => { e.preventDefault(); searchInputRef.current?.focus() } },
+  ])
+
+  const [confirmDialog, setConfirmDialog] = useState<{ open: boolean; title: string; message: string; onConfirm: () => void }>({ open: false, title: '', message: '', onConfirm: () => {} })
+
+  // Detail modal state
+  const [selectedTenantId, setSelectedTenantId] = useState<number | null>(null)
+  const [showDetailModal, setShowDetailModal] = useState(false)
+
+  const [form, setForm] = useState({
+    name: '',
+    tenant_type: 'individual',
+    account_type: 'rental',
+    email: '',
+    phone: '',
+    id_type: 'national_id',
+    id_number: '',
+    property: '' as string | number,
+    unit: '' as string | number,
+  })
+
+  // Fetch properties for selection
+  const { data: propertiesData } = useQuery({
+    queryKey: ['properties-for-tenant'],
+    queryFn: () => propertyApi.list().then(r => r.data),
+    placeholderData: keepPreviousData,
+  })
+  const properties = propertiesData?.results || propertiesData || []
+
+  // Fetch available units for selected property (unoccupied)
+  const { data: unitsData } = useQuery({
+    queryKey: ['available-units', form.property],
+    queryFn: () => unitApi.list({
+      property: form.property,
+      is_occupied: false
+    }).then(r => r.data),
+    enabled: !!form.property,
+    placeholderData: keepPreviousData,
+  })
+  const availableUnits = unitsData?.results || unitsData || []
+
+  // Reset unit when property changes
+  const handlePropertyChange = (propertyId: string | number) => {
+    setForm({ ...form, property: propertyId, unit: '' })
+  }
+
+  // Reset to page 1 when search or filters change
+  const handleSearchChange = (value: string) => {
+    setSearch(value)
+    setCurrentPage(1)
+  }
+
+  const handleFilterChange = (filter: 'tenantType' | 'leaseStatus', value: string) => {
+    if (filter === 'tenantType') setTenantTypeFilter(value)
+    if (filter === 'leaseStatus') setLeaseStatusFilter(value)
+    setCurrentPage(1)
+  }
+
+  // Reset to page 1 when the landlord scope changes via the URL.
+  useEffect(() => {
+    setCurrentPage(1)
+  }, [landlordFilter])
+
+  const { data: tenantsData, isLoading } = useQuery({
+    queryKey: ['tenants', debouncedSearch, currentPage, tenantTypeFilter, leaseStatusFilter, landlordFilter],
+    queryFn: () => tenantApi.list({
+      account_type: 'rental',
+      search: debouncedSearch,
+      page: currentPage,
+      page_size: PAGE_SIZE,
+      ...(tenantTypeFilter && { tenant_type: tenantTypeFilter }),
+      ...(leaseStatusFilter && { lease_status: leaseStatusFilter }),
+      ...(landlordFilter && { landlord: landlordFilter }),
+    }).then(r => r.data),
+    placeholderData: keepPreviousData,
+  })
+
+  // Resolve the landlord's name for the scope banner (only when filtered).
+  const { data: landlordScope } = useQuery({
+    queryKey: ['tenant-landlord-scope', landlordFilter],
+    queryFn: () => landlordApi.get(Number(landlordFilter)).then(r => r.data),
+    enabled: !!landlordFilter,
+    placeholderData: keepPreviousData,
+  })
+
+  const clearLandlordFilter = () => {
+    searchParams.delete('landlord')
+    setSearchParams(searchParams, { replace: true })
+    setCurrentPage(1)
+  }
+
+  // Query for tenant detail
+  const { data: tenantDetail, isLoading: detailLoading } = useQuery({
+    queryKey: ['tenant-detail', selectedTenantId],
+    queryFn: () => tenantApi.detailView(selectedTenantId!).then(r => r.data),
+    enabled: !!selectedTenantId && showDetailModal,
+    placeholderData: keepPreviousData,
+  })
+
+  const handleViewDetails = (tenantId: number) => {
+    navigate(`/dashboard/tenants/${tenantId}`)
+  }
+
+  // Handle "view" query parameter from search navigation
+  useEffect(() => {
+    const viewId = searchParams.get('view')
+    if (viewId) {
+      searchParams.delete('view')
+      setSearchParams(searchParams, { replace: true })
+      navigate(`/dashboard/tenants/${viewId}`, { replace: true })
+    }
+  }, [searchParams, setSearchParams, navigate])
+
+  // Handle both paginated and non-paginated responses
+  const tenants = tenantsData?.results || tenantsData || []
+  const totalCount = tenantsData?.count || tenants.length
+  const totalPages = Math.ceil(totalCount / PAGE_SIZE)
+
+  const resetForm = () => {
+    setShowForm(false)
+    setEditingId(null)
+    setForm({
+      name: '',
+      tenant_type: 'individual',
+      account_type: 'rental',
+      email: '',
+      phone: '',
+      id_type: 'national_id',
+      id_number: '',
+      property: '',
+      unit: '',
+    })
+  }
+
+  const handleEdit = (tenant: any) => {
+    setEditingId(typeof tenant.id === 'number' ? tenant.id : null)
+    setForm({
+      name: tenant.name || '',
+      tenant_type: tenant.tenant_type || 'individual',
+      account_type: tenant.account_type || 'rental',
+      email: tenant.email || '',
+      phone: tenant.phone || '',
+      id_type: tenant.id_type || 'national_id',
+      id_number: tenant.id_number || '',
+      property: '',
+      unit: '',
+    })
+    setShowForm(true)
+  }
+
+  const createMutation = useMutation({
+    mutationFn: (data: any) => {
+      const id = data._editingId
+      const { _editingId, ...payload } = data
+      return id ? tenantApi.update(id, payload) : tenantApi.create(payload)
+    },
+    onMutate: async (newData) => {
+      const isUpdating = !!newData._editingId
+      resetForm()
+      await queryClient.cancelQueries({ queryKey: ['tenants'] })
+      const previousData = queryClient.getQueryData(['tenants', debouncedSearch, currentPage, tenantTypeFilter, leaseStatusFilter])
+
+      if (!isUpdating) {
+        const optimistic = {
+          id: `temp-${Date.now()}`,
+          name: newData.name,
+          tenant_type: newData.tenant_type,
+          account_type: newData.account_type,
+          email: newData.email,
+          phone: newData.phone,
+          has_active_lease: false,
+          lease_count: 0,
+          unit_name: '',
+          created_at: new Date().toISOString(),
+          _isOptimistic: true,
+        }
+        queryClient.setQueryData(['tenants', debouncedSearch, currentPage, tenantTypeFilter, leaseStatusFilter], (old: any) => {
+          const items = old?.results || old || []
+          return old?.results ? { ...old, results: [optimistic, ...items] } : [optimistic, ...items]
+        })
+      } else {
+        queryClient.setQueryData(['tenants', debouncedSearch, currentPage, tenantTypeFilter, leaseStatusFilter], (old: any) => {
+          const items = old?.results || old || []
+          const updatedItems = items.map((item: any) =>
+            item.id === editingId ? { ...item, ...newData, _isUpdating: true } : item
+          )
+          return old?.results ? { ...old, results: updatedItems } : updatedItems
+        })
+      }
+      return { previousData, isUpdating }
+    },
+    onSuccess: (_, __, context) => {
+      showToast.success(context?.isUpdating ? 'Tenant updated' : 'Tenant created')
+      queryClient.invalidateQueries({ predicate: (q) => {
+        const key = q.queryKey[0] as string
+        return key === 'tenants' || key.startsWith('tenant')
+      }})
+    },
+    onError: (error, _, context) => {
+      if (context?.previousData) {
+        queryClient.setQueryData(['tenants', debouncedSearch, currentPage, tenantTypeFilter, leaseStatusFilter], context.previousData)
+      }
+      showToast.error(parseApiError(error, context?.isUpdating ? 'Failed to update tenant' : 'Failed to create tenant'))
+    },
+  })
+
+  const deleteMutation = useMutation({
+    mutationFn: (id: number) => tenantApi.delete(id),
+    onMutate: async (id) => {
+      setDeletingId(id)
+      await queryClient.cancelQueries({ queryKey: ['tenants'] })
+      const previousData = queryClient.getQueryData(['tenants', debouncedSearch, currentPage, tenantTypeFilter, leaseStatusFilter])
+      queryClient.setQueryData(['tenants', debouncedSearch, currentPage, tenantTypeFilter, leaseStatusFilter], (old: any) => {
+        const items = old?.results || old || []
+        const filtered = items.filter((item: any) => item.id !== id)
+        return old?.results ? { ...old, results: filtered } : filtered
+      })
+      return { previousData }
+    },
+    onSuccess: () => {
+      setDeletingId(null)
+      showToast.success('Tenant deleted')
+      queryClient.invalidateQueries({ predicate: (q) => {
+        const key = q.queryKey[0] as string
+        return key === 'tenants' || key.startsWith('tenant')
+      }})
+    },
+    onError: (error, _, context) => {
+      setDeletingId(null)
+      if (context?.previousData) {
+        queryClient.setQueryData(['tenants', debouncedSearch, currentPage, tenantTypeFilter, leaseStatusFilter], context.previousData)
+      }
+      showToast.error(parseApiError(error, 'Failed to delete tenant'))
+    },
+  })
+
+  const handleDelete = (tenant: any) => {
+    if (tenant.has_active_lease) {
+      // Keep confirm dialog for tenants with active leases (risky)
+      setConfirmDialog({
+        open: true,
+        title: `Delete ${tenant.name}?`,
+        message: 'This tenant has active leases. Deleting may fail if there are related records.',
+        onConfirm: () => {
+          setConfirmDialog(d => ({ ...d, open: false }))
+          deleteMutation.mutate(tenant.id)
+        },
+      })
+    } else {
+      undoToast({
+        message: `Deleting "${tenant.name}"...`,
+        onConfirm: () => deleteMutation.mutate(tenant.id),
+      })
+    }
+  }
+
+  const selectableItems = (tenants || []).filter((t: any) => !t._isOptimistic)
+  const pageIds = selectableItems.map((t: any) => t.id)
+
+  const handleBulkExport = () => {
+    const selected = selectableItems.filter((t: any) => selection.isSelected(t.id))
+    exportTableData(selected, [
+      { key: 'name', header: 'Name' },
+      { key: 'code', header: 'Code' },
+      { key: 'tenant_type', header: 'Type' },
+      { key: 'email', header: 'Email' },
+      { key: 'phone', header: 'Phone' },
+    ], 'tenants_export')
+    showToast.success(`Exported ${selected.length} tenants`)
+  }
+
+  const handleBulkDelete = () => {
+    const count = selection.selectedCount
+    const ids = Array.from(selection.selectedIds)
+    selection.clearSelection()
+    undoToast({
+      message: `Deleting ${count} tenants...`,
+      onConfirm: async () => {
+        for (const id of ids) { try { await tenantApi.delete(id) } catch {} }
+        queryClient.invalidateQueries({ predicate: (q) => {
+        const key = q.queryKey[0] as string
+        return key === 'tenants' || key.startsWith('tenant')
+      }})
+        showToast.success(`Deleted ${count} tenants`)
+      },
+    })
+  }
+
+  const handleDownloadTemplate = async () => {
+    try {
+      const response = await importsApi.downloadTemplate('tenants')
+      const blob = response.data as Blob
+      const url = window.URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url
+      a.download = 'import_template_tenants.xlsx'
+      a.click()
+      window.URL.revokeObjectURL(url)
+    } catch {
+      showToast.error('Failed to download template')
+    }
+  }
+
+  return (
+    <div className="space-y-6">
+      <nav className="flex items-center gap-2 text-sm text-gray-500 mb-4">
+        <button onClick={() => navigate('/dashboard')} className="hover:text-gray-900 transition-colors">Dashboard</button>
+        <span>/</span>
+        <span className="text-gray-900 font-medium">Tenants</span>
+      </nav>
+      <div className="flex items-center justify-between">
+        <div>
+          <h1 className="text-2xl font-bold text-gray-900">Tenants</h1>
+          <p className="text-gray-500 mt-1">Manage rental tenants</p>
+        </div>
+        <SplitButton
+          onClick={() => { resetForm(); setShowForm(true) }}
+          menuItems={[
+            { label: 'Chain Add', icon: Wand2, onClick: () => useChainStore.getState().startChain('tenant') },
+            { label: 'Import from File', icon: Upload, onClick: () => navigate('/dashboard/data-import') },
+            { label: 'Download Template', icon: FileSpreadsheet, onClick: handleDownloadTemplate },
+          ]}
+        >
+          <Plus className="w-4 h-4" /> Add Tenant
+        </SplitButton>
+      </div>
+
+      {landlordFilter && (
+        <div className="flex items-center justify-between gap-3 rounded-lg border border-primary-200 bg-primary-50 px-4 py-3">
+          <div className="flex items-center gap-2 text-sm text-primary-900">
+            <Building2 className="w-4 h-4 text-primary-600" />
+            <span>
+              Showing tenants under{' '}
+              <button
+                onClick={() => navigate(`/dashboard/landlords/${landlordFilter}`)}
+                className="font-semibold underline underline-offset-2 hover:text-primary-700"
+              >
+                {landlordScope?.name || `landlord #${landlordFilter}`}
+              </button>
+              {"'s properties"}
+            </span>
+          </div>
+          <button
+            onClick={clearLandlordFilter}
+            className="inline-flex items-center gap-1 text-xs font-medium text-primary-700 hover:text-primary-900"
+          >
+            <X className="w-3.5 h-3.5" /> Clear filter
+          </button>
+        </div>
+      )}
+
+      <div className="card p-4">
+        <div className="flex flex-wrap items-center gap-4">
+          <div className="relative flex-1 min-w-[200px] max-w-md">
+            <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-5 h-5 text-gray-400" />
+            <input
+              ref={searchInputRef}
+              type="text"
+              placeholder="Search tenants..."
+              value={search}
+              onChange={(e) => handleSearchChange(e.target.value)}
+              className="input pl-10"
+            />
+          </div>
+          <Select
+            value={tenantTypeFilter}
+            onChange={(e) => handleFilterChange('tenantType', e.target.value)}
+            className="min-w-[140px]"
+            options={tenantTypeOptions}
+          />
+          <Select
+            value={leaseStatusFilter}
+            onChange={(e) => handleFilterChange('leaseStatus', e.target.value)}
+            className="min-w-[160px]"
+            options={leaseStatusOptions}
+          />
+          <div className="flex items-center gap-3 ml-auto">
+            {selectableItems.length > 0 && (
+              <label className="flex items-center gap-2 cursor-pointer text-sm text-gray-500">
+                <SelectionCheckbox
+                  checked={selection.isAllPageSelected(pageIds)}
+                  indeterminate={selection.isPartialPageSelected(pageIds)}
+                  onChange={() => selection.selectPage(pageIds)}
+                />
+                Select all
+              </label>
+            )}
+            <p className="text-sm text-gray-500">
+              {totalCount} tenant{totalCount !== 1 ? 's' : ''} total
+            </p>
+          </div>
+        </div>
+      </div>
+
+      {showForm && (
+        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
+          <motion.div
+            initial={{ opacity: 0, scale: 0.95 }}
+            animate={{ opacity: 1, scale: 1 }}
+            className="bg-white rounded-xl shadow-xl w-full max-w-lg mx-4 p-6"
+          >
+            <h2 className="text-lg font-semibold mb-4">{editingId ? 'Edit Tenant' : 'Add New Tenant'}</h2>
+            <TenantForm
+              initialValues={form}
+              onSubmit={(data) => createMutation.mutate({ ...(data as typeof form), _editingId: editingId })}
+              isSubmitting={createMutation.isPending}
+              onCancel={resetForm}
+            />
+          </motion.div>
+        </div>
+      )}
+
+      {/* Table View */}
+      <div className="bg-white rounded-xl border border-gray-200 shadow-sm overflow-hidden">
+        <div className="overflow-x-auto">
+          {isLoading ? (
+            <div className="p-6">
+              <div className="space-y-3">
+                {[...Array(8)].map((_, i) => (
+                  <div key={i} className="flex gap-4 animate-pulse">
+                    <div className="h-4 w-6 bg-gray-200 rounded" />
+                    <div className="h-4 flex-[2] bg-gray-200 rounded" />
+                    <div className="h-4 flex-1 bg-gray-200 rounded" />
+                    <div className="h-4 flex-1 bg-gray-200 rounded" />
+                    <div className="h-4 flex-1 bg-gray-200 rounded" />
+                    <div className="h-4 flex-1 bg-gray-200 rounded" />
+                    <div className="h-4 flex-1 bg-gray-200 rounded" />
+                    <div className="h-4 flex-1 bg-gray-200 rounded" />
+                  </div>
+                ))}
+              </div>
+            </div>
+          ) : !tenants?.length ? (
+            <div className="p-12">
+              <EmptyState
+                icon={TbUserSquareRounded}
+                title="No tenants yet"
+                description="Add your first tenant to start managing lease agreements and billing."
+                action={{
+                  label: 'Add Tenant',
+                  onClick: () => setShowForm(true)
+                }}
+              />
+            </div>
+          ) : (
+            <table className="w-full">
+              <thead className="sticky top-0 z-10 bg-gray-50/80 backdrop-blur-sm border-b-2 border-gray-100">
+                <tr>
+                  <th className="w-10 px-3 py-3.5">
+                    <SelectionCheckbox
+                      checked={selection.isAllPageSelected(pageIds)}
+                      indeterminate={selection.isPartialPageSelected(pageIds)}
+                      onChange={() => selection.selectPage(pageIds)}
+                    />
+                  </th>
+                  <th className="text-left text-xs font-semibold text-gray-500 uppercase tracking-wider px-4 py-2">Tenant Name</th>
+                  <th className="text-left text-xs font-semibold text-gray-500 uppercase tracking-wider px-4 py-2 hidden md:table-cell">Code</th>
+                  <th className="text-left text-xs font-semibold text-gray-500 uppercase tracking-wider px-4 py-2">Account Type</th>
+                  <th className="text-left text-xs font-semibold text-gray-500 uppercase tracking-wider px-4 py-2 hidden lg:table-cell">Email</th>
+                  <th className="text-left text-xs font-semibold text-gray-500 uppercase tracking-wider px-4 py-2 hidden xl:table-cell">Phone</th>
+                  <th className="text-left text-xs font-semibold text-gray-500 uppercase tracking-wider px-4 py-2">Property / Unit</th>
+                  <th className="text-left text-xs font-semibold text-gray-500 uppercase tracking-wider px-4 py-2">Balance</th>
+                  <th className="text-left text-xs font-semibold text-gray-500 uppercase tracking-wider px-4 py-2">Status</th>
+                  <th className="text-right text-xs font-semibold text-gray-500 uppercase tracking-wider px-4 py-2 w-28">Actions</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-gray-100">
+                {tenants.map((tenant: any) => {
+                  const isOptimistic = tenant._isOptimistic
+                  const isUpdating = tenant._isUpdating
+                  const balance = tenant.balance_due ?? tenant.balance ?? tenant.billing_summary?.balance_due ?? 0
+                  return (
+                    <tr
+                      key={tenant.id}
+                      onClick={() => !isOptimistic && !isUpdating && navigate(`/dashboard/tenants/${tenant.id}`)}
+                      onMouseEnter={() => !isOptimistic && !isUpdating && prefetch(`/dashboard/tenants/${tenant.id}`)}
+                      className={cn(
+                        'group transition-colors',
+                        isOptimistic || isUpdating
+                          ? 'bg-primary-50/50'
+                          : 'hover:bg-gray-50 cursor-pointer',
+                        !isOptimistic && selection.isSelected(tenant.id) && 'bg-primary-50/30'
+                      )}
+                    >
+                      <td className="w-10 px-3 py-3.5" onClick={(e) => e.stopPropagation()}>
+                        {!isOptimistic && !isUpdating && (
+                          <SelectionCheckbox
+                            checked={selection.isSelected(tenant.id)}
+                            onChange={() => selection.toggle(tenant.id)}
+                          />
+                        )}
+                      </td>
+                      <td className="px-4 py-2">
+                        <div className="flex items-center gap-2 min-w-0">
+                          <div className={cn(
+                            'w-7 h-7 rounded-md flex items-center justify-center flex-shrink-0',
+                            isOptimistic || isUpdating ? 'bg-primary-100' : 'bg-purple-100'
+                          )}>
+                            {isOptimistic || isUpdating ? (
+                              <Loader2 className="w-4 h-4 text-primary-600 animate-spin" />
+                            ) : (
+                              <TbUserSquareRounded className="w-4 h-4 text-purple-600" />
+                            )}
+                          </div>
+                          <button
+                            onClick={(e) => { e.stopPropagation(); navigate(`/dashboard/tenants/${tenant.id}`) }}
+                            className="font-medium text-sm text-gray-900 hover:text-primary-600 hover:underline truncate text-left"
+                            title={tenant.name}
+                          >
+                            {tenant.name}
+                          </button>
+                        </div>
+                      </td>
+                      <td className="px-4 py-2 text-[11px] text-gray-500 font-mono hidden md:table-cell whitespace-nowrap">{tenant.code || '—'}</td>
+                      <td className="px-4 py-2">
+                        <span className={cn(
+                          'inline-flex items-center whitespace-nowrap px-2.5 py-0.5 rounded-full text-xs font-medium',
+                          tenant.account_type === 'levy'
+                            ? 'bg-violet-50 text-violet-600'
+                            : 'bg-sky-50 text-sky-600'
+                        )}>
+                          {tenant.account_type === 'levy' ? 'Levy' : 'Rental'}
+                        </span>
+                      </td>
+                      <td className="px-4 py-2 text-sm text-gray-900 truncate max-w-[200px] hidden lg:table-cell">{tenant.email || '\u2014'}</td>
+                      <td className="px-4 py-2 text-sm text-gray-900 hidden xl:table-cell">{tenant.phone || '\u2014'}</td>
+                      <td className="px-4 py-2 text-sm">
+                        {tenant.property_name || tenant.unit_name ? (
+                          <div className="flex items-center gap-1 flex-wrap">
+                            {tenant.property_name && (
+                              tenant.property_id ? (
+                                <button
+                                  onClick={(e) => { e.stopPropagation(); navigate(`/dashboard/properties/${tenant.property_id}`) }}
+                                  onMouseEnter={() => prefetch(`/dashboard/properties/${tenant.property_id}`)}
+                                  className="text-gray-600 text-xs hover:text-primary-600 hover:underline"
+                                >
+                                  {tenant.property_name}
+                                </button>
+                              ) : (
+                                <span className="text-gray-500 text-xs">{tenant.property_name}</span>
+                              )
+                            )}
+                            {tenant.property_name && tenant.unit_name && (
+                              <span className="text-gray-300 text-xs">&middot;</span>
+                            )}
+                            {tenant.unit_name && (
+                              tenant.unit_id ? (
+                                <button
+                                  onClick={(e) => { e.stopPropagation(); navigate(`/dashboard/units/${tenant.unit_id}`) }}
+                                  onMouseEnter={() => prefetch(`/dashboard/units/${tenant.unit_id}`)}
+                                  className="font-medium text-primary-600 hover:text-primary-700 hover:underline"
+                                >
+                                  {tenant.unit_name}
+                                </button>
+                              ) : (
+                                <span className="text-gray-700">{tenant.unit_name}</span>
+                              )
+                            )}
+                          </div>
+                        ) : (
+                          <span className="text-gray-400">-</span>
+                        )}
+                      </td>
+                      <td className="px-4 py-2 text-sm font-semibold tabular-nums">
+                        <span className={cn(
+                          Number(balance) > 0 ? 'text-red-600' : Number(balance) === 0 ? 'text-emerald-600' : 'text-gray-900'
+                        )}>
+                          {formatCurrency(Number(balance) || 0)}
+                        </span>
+                      </td>
+                      <td className="px-4 py-2">
+                        {tenant.has_active_lease ? (
+                          <span className="inline-flex items-center whitespace-nowrap px-2.5 py-0.5 rounded-full text-xs font-medium bg-emerald-50 text-emerald-700">
+                            Active
+                          </span>
+                        ) : (
+                          <span className="inline-flex items-center whitespace-nowrap px-2.5 py-0.5 rounded-full text-xs font-medium bg-gray-100 text-gray-500">
+                            No lease
+                          </span>
+                        )}
+                      </td>
+                      <td className="px-4 py-2 text-right">
+                        {!isOptimistic && !isUpdating ? (
+                          <div className="flex items-center justify-end gap-1 opacity-0 group-hover:opacity-100 transition-opacity" onClick={(e) => e.stopPropagation()}>
+                            <button
+                              onMouseEnter={() => prefetch(`/dashboard/tenants/${tenant.id}`)}
+                              onClick={() => handleViewDetails(tenant.id)}
+                              className="p-1.5 text-gray-400 hover:text-primary-600 hover:bg-primary-50 rounded-lg transition-colors"
+                              title="View details"
+                            >
+                              <Eye className="w-4 h-4" />
+                            </button>
+                            <button
+                              onClick={() => handleEdit(tenant)}
+                              className="p-1.5 text-gray-400 hover:text-primary-600 hover:bg-primary-50 rounded-lg transition-colors"
+                              title="Edit"
+                            >
+                              <Edit2 className="w-4 h-4" />
+                            </button>
+                            <button
+                              onClick={() => handleDelete(tenant)}
+                              disabled={deleteMutation.isPending}
+                              className="p-1.5 text-gray-400 hover:text-red-500 hover:bg-red-50 rounded-lg transition-colors"
+                              title="Delete"
+                            >
+                              {deleteMutation.isPending && deletingId === tenant.id ? (
+                                <Loader2 className="w-4 h-4 animate-spin" />
+                              ) : (
+                                <Trash2 className="w-4 h-4" />
+                              )}
+                            </button>
+                          </div>
+                        ) : null}
+                      </td>
+                    </tr>
+                  )
+                })}
+              </tbody>
+            </table>
+          )}
+        </div>
+      </div>
+
+      {/* Pagination */}
+      {totalPages > 1 && (
+        <div className="card overflow-hidden">
+          <Pagination
+            currentPage={currentPage}
+            totalPages={totalPages}
+            totalItems={totalCount}
+            pageSize={PAGE_SIZE}
+            onPageChange={setCurrentPage}
+            showPageSize={false}
+          />
+        </div>
+      )}
+
+      <BulkActionsBar
+        selectedCount={selection.selectedCount}
+        onClearSelection={selection.clearSelection}
+        entityName="tenants"
+        actions={[
+          { label: 'Export', icon: Download, onClick: handleBulkExport, variant: 'outline' },
+          { label: 'Delete', icon: Trash2, onClick: handleBulkDelete, variant: 'danger' },
+        ]}
+      />
+
+      <ConfirmDialog
+        open={confirmDialog.open}
+        onClose={() => setConfirmDialog(d => ({ ...d, open: false }))}
+        onConfirm={confirmDialog.onConfirm}
+        title={confirmDialog.title}
+        message={confirmDialog.message}
+        type="danger"
+        confirmText="Confirm"
+      />
+
+      {/* Tenant Detail Modal */}
+      <AnimatePresence>
+        {showDetailModal && (
+          <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
+            <motion.div
+              initial={{ opacity: 0, scale: 0.95 }}
+              animate={{ opacity: 1, scale: 1 }}
+              exit={{ opacity: 0, scale: 0.95 }}
+              className="bg-white rounded-xl shadow-xl w-full max-w-3xl max-h-[90vh] overflow-hidden"
+            >
+              {/* Header */}
+              <div className="flex items-center justify-between p-6 border-b border-gray-100">
+                <div className="flex items-center gap-3">
+                  <div className="w-12 h-12 rounded-xl bg-purple-100 flex items-center justify-center">
+                    <TbUserSquareRounded className="w-6 h-6 text-purple-600" />
+                  </div>
+                  {detailLoading ? (
+                    <div className="space-y-2">
+                      <div className="h-5 w-40 bg-gray-200 rounded animate-pulse" />
+                      <div className="h-3 w-24 bg-gray-100 rounded animate-pulse" />
+                    </div>
+                  ) : (
+                    <div>
+                      <h2 className="text-xl font-semibold text-gray-900">
+                        {tenantDetail?.tenant?.name}
+                      </h2>
+                      <p className="text-sm text-gray-500">{tenantDetail?.tenant?.code}</p>
+                    </div>
+                  )}
+                </div>
+                <button
+                  onClick={() => {
+                    setShowDetailModal(false)
+                    setSelectedTenantId(null)
+                  }}
+                  className="text-gray-400 hover:text-gray-600"
+                >
+                  <X className="w-5 h-5" />
+                </button>
+              </div>
+
+              {/* Content */}
+              <div className="p-6 overflow-y-auto max-h-[calc(90vh-80px)]">
+                {detailLoading ? (
+                  <div className="space-y-6 animate-pulse">
+                    <div className="grid grid-cols-2 gap-4">
+                      {[...Array(4)].map((_, i) => (
+                        <div key={i} className="space-y-2">
+                          <div className="h-3 w-20 bg-gray-200 rounded" />
+                          <div className="h-4 w-32 bg-gray-100 rounded" />
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                ) : tenantDetail && (
+                  <div className="space-y-6">
+                    {/* Contact Info */}
+                    <div>
+                      <h3 className="text-sm font-semibold text-gray-500 uppercase tracking-wider mb-3">
+                        Contact Information
+                      </h3>
+                      <div className="grid grid-cols-2 gap-4">
+                        <div>
+                          <p className="text-xs text-gray-500">Email</p>
+                          <p className="text-sm font-medium">{tenantDetail.tenant.email}</p>
+                        </div>
+                        <div>
+                          <p className="text-xs text-gray-500">Phone</p>
+                          <p className="text-sm font-medium">{tenantDetail.tenant.phone}</p>
+                        </div>
+                        <div>
+                          <p className="text-xs text-gray-500">Type</p>
+                          <p className="text-sm font-medium capitalize">{tenantDetail.tenant.tenant_type}</p>
+                        </div>
+                        <div>
+                          <p className="text-xs text-gray-500">ID Number</p>
+                          <p className="text-sm font-medium">{tenantDetail.tenant.id_number || '-'}</p>
+                        </div>
+                        {tenantDetail.tenant.employer_name && (
+                          <div>
+                            <p className="text-xs text-gray-500">Employer</p>
+                            <p className="text-sm font-medium">{tenantDetail.tenant.employer_name}</p>
+                          </div>
+                        )}
+                        {tenantDetail.tenant.occupation && (
+                          <div>
+                            <p className="text-xs text-gray-500">Occupation</p>
+                            <p className="text-sm font-medium">{tenantDetail.tenant.occupation}</p>
+                          </div>
+                        )}
+                      </div>
+                    </div>
+
+                    {/* Billing Summary */}
+                    <div>
+                      <h3 className="text-sm font-semibold text-gray-500 uppercase tracking-wider mb-3">
+                        Billing Summary
+                      </h3>
+                      <div className="grid grid-cols-4 gap-4">
+                        <Tooltip content="Sum of all invoices issued">
+                          <div className="bg-gray-50 rounded-lg p-3">
+                            <p className="text-xs text-gray-500">Total Invoiced</p>
+                            <p className="text-lg font-semibold text-gray-900">
+                              {formatCurrency(tenantDetail.billing_summary?.total_invoiced || 0)}
+                            </p>
+                          </div>
+                        </Tooltip>
+                        <Tooltip content="Total payments received">
+                          <div className="bg-gray-50 rounded-lg p-3">
+                            <p className="text-xs text-gray-500">Total Paid</p>
+                            <p className="text-lg font-semibold text-green-600">
+                              {formatCurrency(tenantDetail.billing_summary?.total_paid || 0)}
+                            </p>
+                          </div>
+                        </Tooltip>
+                        <Tooltip content="Current outstanding amount">
+                          <div className="bg-gray-50 rounded-lg p-3">
+                            <p className="text-xs text-gray-500">Balance Due</p>
+                            <p className={`text-lg font-semibold ${
+                              tenantDetail.billing_summary?.balance_due > 0 ? 'text-amber-600' : 'text-gray-900'
+                            }`}>
+                              {formatCurrency(tenantDetail.billing_summary?.balance_due || 0)}
+                            </p>
+                          </div>
+                        </Tooltip>
+                        <Tooltip content="Amount past due date">
+                          <div className="bg-gray-50 rounded-lg p-3">
+                            <p className="text-xs text-gray-500">Overdue</p>
+                            <p className={`text-lg font-semibold ${
+                              tenantDetail.billing_summary?.overdue_amount > 0 ? 'text-red-600' : 'text-gray-900'
+                            }`}>
+                              {formatCurrency(tenantDetail.billing_summary?.overdue_amount || 0)}
+                            </p>
+                          </div>
+                        </Tooltip>
+                      </div>
+                    </div>
+
+                    {/* Active Leases */}
+                    <div>
+                      <h3 className="text-sm font-semibold text-gray-500 uppercase tracking-wider mb-3">
+                        Active Leases ({tenantDetail.active_leases?.length || 0})
+                      </h3>
+                      {tenantDetail.active_leases?.length > 0 ? (
+                        <div className="space-y-2">
+                          {tenantDetail.active_leases.map((lease: any) => (
+                            <div key={lease.id} className="flex items-center justify-between p-3 bg-green-50 rounded-lg border border-green-100">
+                              <div className="flex items-center gap-3">
+                                <Building2 className="w-5 h-5 text-green-600" />
+                                <div>
+                                  <p className="font-medium text-gray-900">
+                                    {lease.unit_id ? (
+                                      <span
+                                        onClick={() => navigate(`/dashboard/units/${lease.unit_id}`)}
+                                        onMouseEnter={() => prefetch(`/dashboard/units/${lease.unit_id}`)}
+                                        className="text-primary-600 hover:text-primary-700 hover:underline cursor-pointer"
+                                      >
+                                        {lease.unit}
+                                      </span>
+                                    ) : (
+                                      lease.unit
+                                    )}
+                                  </p>
+                                  <p className="text-xs text-gray-500">
+                                    {lease.property_id ? (
+                                      <span
+                                        onClick={() => navigate(`/dashboard/properties/${lease.property_id}`)}
+                                        onMouseEnter={() => prefetch(`/dashboard/properties/${lease.property_id}`)}
+                                        className="text-primary-600 hover:text-primary-700 hover:underline cursor-pointer"
+                                      >
+                                        {lease.property}
+                                      </span>
+                                    ) : (
+                                      lease.property
+                                    )}
+                                    {' • '}
+                                    {lease.id ? (
+                                      <span
+                                        onClick={() => navigate(`/dashboard/leases/${lease.id}`)}
+                                        onMouseEnter={() => prefetch(`/dashboard/leases/${lease.id}`)}
+                                        className="text-primary-600 hover:text-primary-700 hover:underline cursor-pointer"
+                                      >
+                                        {lease.lease_number}
+                                      </span>
+                                    ) : (
+                                      lease.lease_number
+                                    )}
+                                  </p>
+                                </div>
+                              </div>
+                              <div className="text-right">
+                                <p className="font-semibold text-gray-900">
+                                  {lease.currency} {lease.monthly_rent}/mo
+                                </p>
+                                <p className="text-xs text-gray-500">
+                                  Ends: {formatDate(lease.end_date)}
+                                </p>
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                      ) : (
+                        <p className="text-sm text-gray-400 italic">No active leases</p>
+                      )}
+                    </div>
+
+                    {/* Lease History */}
+                    {tenantDetail.lease_history?.length > 0 && (
+                      <div>
+                        <h3 className="text-sm font-semibold text-gray-500 uppercase tracking-wider mb-3">
+                          Lease History ({tenantDetail.lease_history?.length || 0})
+                        </h3>
+                        <div className="space-y-2">
+                          {tenantDetail.lease_history.map((lease: any) => (
+                            <div
+                              key={lease.id}
+                              className="flex items-center justify-between p-3 bg-gray-50 rounded-lg hover:bg-gray-100 cursor-pointer transition-colors"
+                              onClick={() => lease.id && navigate(`/dashboard/leases/${lease.id}`)}
+                              onMouseEnter={() => lease.id && prefetch(`/dashboard/leases/${lease.id}`)}
+                            >
+                              <div className="flex items-center gap-3">
+                                <Building2 className="w-5 h-5 text-gray-400" />
+                                <div>
+                                  <p className="font-medium text-gray-700">
+                                    {lease.unit_id ? (
+                                      <span
+                                        onClick={(e) => { e.stopPropagation(); navigate(`/dashboard/units/${lease.unit_id}`) }}
+                                        onMouseEnter={() => prefetch(`/dashboard/units/${lease.unit_id}`)}
+                                        className="text-primary-600 hover:text-primary-700 hover:underline cursor-pointer"
+                                      >
+                                        {lease.unit}
+                                      </span>
+                                    ) : (
+                                      lease.unit
+                                    )}
+                                  </p>
+                                  <p className="text-xs text-gray-500">
+                                    {lease.property_id ? (
+                                      <span
+                                        onClick={(e) => { e.stopPropagation(); navigate(`/dashboard/properties/${lease.property_id}`) }}
+                                        onMouseEnter={() => prefetch(`/dashboard/properties/${lease.property_id}`)}
+                                        className="text-primary-600 hover:text-primary-700 hover:underline cursor-pointer"
+                                      >
+                                        {lease.property}
+                                      </span>
+                                    ) : (
+                                      lease.property
+                                    )}
+                                    {' • '}{formatDate(lease.start_date)} - {formatDate(lease.end_date)}
+                                  </p>
+                                </div>
+                              </div>
+                              <span className={`text-xs px-2 py-1 rounded ${
+                                lease.status === 'terminated'
+                                  ? 'bg-red-100 text-red-700'
+                                  : lease.status === 'expired'
+                                  ? 'bg-gray-100 text-gray-600'
+                                  : 'bg-amber-100 text-amber-700'
+                              }`}>
+                                {lease.status}
+                              </span>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+
+                    {/* Recent Invoices */}
+                    {tenantDetail.recent_invoices?.length > 0 && (
+                      <div>
+                        <h3 className="text-sm font-semibold text-gray-500 uppercase tracking-wider mb-3">
+                          Recent Invoices
+                        </h3>
+                        <div className="space-y-2">
+                          {tenantDetail.recent_invoices.slice(0, 5).map((invoice: any) => (
+                            <div key={invoice.id} className="flex items-center justify-between p-2 border border-gray-100 rounded-lg">
+                              <div className="flex items-center gap-2">
+                                <FileText className="w-4 h-4 text-gray-400" />
+                                {invoice.id ? (
+                                  <span
+                                    onClick={() => navigate(`/dashboard/invoices/${invoice.id}`)}
+                                    onMouseEnter={() => prefetch(`/dashboard/invoices/${invoice.id}`)}
+                                    className="text-sm font-medium text-primary-600 hover:text-primary-700 hover:underline cursor-pointer"
+                                  >
+                                    {invoice.invoice_number}
+                                  </span>
+                                ) : (
+                                  <span className="text-sm font-medium">{invoice.invoice_number}</span>
+                                )}
+                                <span className="text-xs text-gray-500">{formatDate(invoice.date)}</span>
+                              </div>
+                              <div className="flex items-center gap-2">
+                                <span className="text-sm font-medium">{formatCurrency(invoice.amount)}</span>
+                                <span className={`text-xs px-1.5 py-0.5 rounded ${
+                                  invoice.status === 'paid'
+                                    ? 'bg-green-100 text-green-700'
+                                    : invoice.status === 'overdue'
+                                    ? 'bg-red-100 text-red-700'
+                                    : 'bg-amber-100 text-amber-700'
+                                }`}>
+                                  {invoice.status}
+                                </span>
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
+    </div>
+  )
+}

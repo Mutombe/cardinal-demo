@@ -1,0 +1,5303 @@
+"""Views for financial reports."""
+import hashlib
+import logging
+from decimal import Decimal
+from rest_framework.views import APIView
+from rest_framework.response import Response
+from rest_framework.permissions import IsAuthenticated
+from django.db.models import Sum, Count, Q, F, Avg, Case, When, Value, CharField, DecimalField
+from django.db.models.functions import Coalesce, TruncMonth
+from django.utils import timezone
+from django.core.cache import cache
+from django.http import HttpResponse
+from datetime import timedelta, date
+import csv
+import io
+from apps.accounting.models import ChartOfAccount, GeneralLedger, Journal, BankAccount, IncomeType
+from apps.billing.models import Invoice, Receipt, Expense
+from apps.masterfile.models import Property, Unit, Landlord, RentalTenant, LeaseAgreement
+
+logger = logging.getLogger(__name__)
+
+
+def _gl_filter_for_landlord(landlord_id=None, property_id=None):
+    """Build a Q clause for GeneralLedger restricting to entries that trace
+    back to a landlord (and optionally a single property under that landlord).
+
+    A receipt is "for" a landlord when any of these is true:
+      - the tenant has a unit on one of the landlord's properties
+      - the tenant has a lease on one of the landlord's properties (covers
+        tenants without a direct unit assignment — e.g. levy account holders)
+      - the linked invoice points at one of the landlord's properties or
+        units (covers ad-hoc receipts and property-level levy invoices)
+
+    Returns None when no scoping is requested so callers can short-circuit
+    onto the fast unscoped paths.
+
+    Note: ``RentalTenant`` has no direct ``property`` FK — only ``unit`` —
+    so we DO NOT use ``tenant__property__…`` (raises FieldError). We bridge
+    via leases instead.
+
+    Builds Subquery-backed filters rather than materialising id lists, so
+    the database does the join work and the cost stays sub-linear in tenant
+    count. Big difference in production where there can be thousands of
+    receipts/invoices/expenses.
+    """
+    if not landlord_id and not property_id:
+        return None
+
+    from django.db.models import Subquery
+
+    # Tenants linked to the landlord via either a direct unit or a lease.
+    tenant_filter = Q()
+    if landlord_id:
+        tenant_filter &= (
+            Q(unit__property__landlord_id=landlord_id) |
+            Q(leases__property__landlord_id=landlord_id) |
+            Q(leases__unit__property__landlord_id=landlord_id)
+        )
+    if property_id:
+        tenant_filter &= (
+            Q(unit__property_id=property_id) |
+            Q(leases__property_id=property_id) |
+            Q(leases__unit__property_id=property_id)
+        )
+    tenant_subq = RentalTenant.objects.filter(tenant_filter).values('id').distinct()
+
+    receipt_qs = Receipt.objects.all()
+    expense_qs = Expense.objects.all()
+    invoice_qs = Invoice.objects.all()
+
+    if landlord_id:
+        receipt_qs = receipt_qs.filter(
+            Q(tenant_id__in=Subquery(tenant_subq)) |
+            Q(invoice__property__landlord_id=landlord_id) |
+            Q(invoice__unit__property__landlord_id=landlord_id)
+        )
+        expense_qs = expense_qs.filter(landlord_id=landlord_id)
+        invoice_qs = invoice_qs.filter(
+            Q(unit__property__landlord_id=landlord_id) |
+            Q(property__landlord_id=landlord_id)
+        )
+
+    if property_id:
+        receipt_qs = receipt_qs.filter(
+            Q(tenant_id__in=Subquery(tenant_subq)) |
+            Q(invoice__property_id=property_id) |
+            Q(invoice__unit__property_id=property_id)
+        )
+        invoice_qs = invoice_qs.filter(
+            Q(unit__property_id=property_id) | Q(property_id=property_id)
+        )
+
+    # Opening balances are landlord-LEVEL (the Opening Layer entries
+    # carry no property FK — a loan, a fixed asset, etc. applies to the
+    # landlord's whole portfolio, not a specific property). When the
+    # report is scoped to a specific property we exclude them; when
+    # scoped to a landlord without property they're included so the
+    # landlord's Balance Sheet, Trial Balance, and trust composition all
+    # reflect their pre-existing assets/liabilities.
+    base_q = (
+        Q(journal_entry__source_type='receipt', journal_entry__source_id__in=Subquery(receipt_qs.values('id'))) |
+        Q(journal_entry__source_type='expense', journal_entry__source_id__in=Subquery(expense_qs.values('id'))) |
+        Q(journal_entry__source_type='invoice', journal_entry__source_id__in=Subquery(invoice_qs.values('id')))
+    )
+    if landlord_id and not property_id:
+        # `.order_by()` strips the model's default ordering so the
+        # Subquery doesn't carry an ORDER BY clause inside the outer
+        # IN(...) — some backends fault on it.
+        try:
+            from apps.accounting.models import OpeningBalance
+            ob_id_qs = OpeningBalance.objects.filter(
+                landlord_id=landlord_id,
+            ).order_by().values('id')
+            base_q = base_q | Q(
+                journal_entry__source_type='opening_balance',
+                journal_entry__source_id__in=Subquery(ob_id_qs),
+            )
+        except Exception:
+            # Defensive: never let a failure here (import error, model
+            # missing on this tenant schema, etc.) break the entire
+            # scope filter. The Balance Sheet will just miss the OB
+            # contribution this one request and recover automatically.
+            logger.exception('Failed to extend GL scope filter with opening balances')
+
+        # Operational Layer (BalanceSheetMovement) — same landlord-only
+        # dimension as Opening Balances. Without this branch, asset
+        # swaps and creditor-settlement entries posted via the BS
+        # Movements module are invisible on the landlord's scoped
+        # Balance Sheet / Trial Balance.
+        try:
+            from apps.accounting.models import BalanceSheetMovement
+            bsm_id_qs = BalanceSheetMovement.objects.filter(
+                landlord_id=landlord_id,
+            ).order_by().values('id')
+            base_q = base_q | Q(
+                journal_entry__source_type='bs_movement',
+                journal_entry__source_id__in=Subquery(bsm_id_qs),
+            )
+        except Exception:
+            logger.exception('Failed to extend GL scope filter with bs_movement')
+    return base_q
+
+
+def _commission_expr():
+    """Build a Case/When expression that returns the commission amount
+    for each Receipt row (intended for `.aggregate(Sum(_commission_expr()))`).
+
+    Resolution chain (descending priority), all expressed in pure SQL:
+      1. PropertyIncomeCommission(property=invoice.unit.property,
+         income_type=receipt.income_type) — per-(property, income_type)
+         override. APPLIES regardless of IncomeType.is_commissionable —
+         agencies negotiate commission on income types that are globally
+         non-commissionable for specific landlords (e.g. levy fees on a
+         particular block of flats).
+      2. PropertyIncomeCommission(property=invoice.property, …) — same
+         override but resolved through invoice.property (used for property-
+         level levy invoices that have no unit).
+      3. IncomeType.default_commission_rate — fallback per income type,
+         applied only when the type is globally commissionable AND no
+         override exists.
+      4. 0 — when no override, no income type, or non-commissionable
+         and no override.
+
+    Returns a `DecimalField` expression in money units (amount * rate / 100).
+    Landlord.commission_rate is no longer consulted here.
+    """
+    from django.db.models import Subquery, OuterRef
+    from apps.masterfile.models import PropertyIncomeCommission
+
+    rate_via_unit = PropertyIncomeCommission.objects.filter(
+        property_id=OuterRef('invoice__unit__property_id'),
+        income_type_id=OuterRef('income_type_id'),
+    ).values('rate')[:1]
+    rate_via_property = PropertyIncomeCommission.objects.filter(
+        property_id=OuterRef('invoice__property_id'),
+        income_type_id=OuterRef('income_type_id'),
+    ).values('rate')[:1]
+
+    # Default rate ONLY applies when the income type is globally
+    # commissionable. Override always applies (even on non-commissionable
+    # types) — see docstring. Coalesce picks the first non-null.
+    fallback_default = Case(
+        When(income_type__is_commissionable=True,
+             then=F('income_type__default_commission_rate')),
+        default=Value(Decimal('0')),
+        output_field=DecimalField(max_digits=5, decimal_places=2),
+    )
+
+    effective_rate = Coalesce(
+        Subquery(rate_via_unit, output_field=DecimalField(max_digits=5, decimal_places=2)),
+        Subquery(rate_via_property, output_field=DecimalField(max_digits=5, decimal_places=2)),
+        fallback_default,
+        Value(Decimal('0')),
+        output_field=DecimalField(max_digits=5, decimal_places=2),
+    )
+
+    # Outer Case ensures we only multiply when there's an income_type at
+    # all. Override applies even on non-commissionable types now.
+    return Case(
+        When(
+            income_type__isnull=False,
+            then=F('amount') * effective_rate / Value(Decimal('100')),
+        ),
+        default=Value(Decimal('0')),
+        output_field=DecimalField(max_digits=18, decimal_places=2),
+    )
+
+
+def _receipt_scope_q(unit_id_list, property_id_list):
+    """Build the Q-clause matching every invoice→property linkage path.
+
+    Receipts may carry their property tie via: direct unit, direct property,
+    or the lease chain (invoice.lease.unit.property or invoice.lease.property).
+    The standard InvoiceCreateSerializer takes `lease`+optional `unit`, so
+    without the lease branch every receipt whose invoice was created that
+    way silently drops out of landlord-scoped reports.
+
+    Module-level so report views can share the chain and tests can walk
+    the resulting Q tree without spinning up a tenant database.
+    """
+    via_invoice = (
+        Q(invoice__unit_id__in=unit_id_list) |
+        Q(invoice__property_id__in=property_id_list) |
+        Q(invoice__lease__unit_id__in=unit_id_list) |
+        Q(invoice__lease__property_id__in=property_id_list)
+    )
+    # Direct-payment receipts carry NO invoice (ad-hoc payments captured
+    # without raising an invoice first). They scope through the paying
+    # tenant's own unit or lease chain instead — otherwise every such
+    # receipt silently drops out of landlord-scoped reports (Income
+    # Statement, Income & Expenditure, Landlord/Tenant Account, …).
+    via_tenant = Q(invoice__isnull=True) & (
+        Q(tenant__unit_id__in=unit_id_list) |
+        Q(tenant__unit__property_id__in=property_id_list) |
+        Q(tenant__leases__unit_id__in=unit_id_list) |
+        Q(tenant__leases__property_id__in=property_id_list) |
+        Q(tenant__leases__unit__property_id__in=property_id_list)
+    )
+    return via_invoice | via_tenant
+
+
+def _invoice_scope_q(unit_id_list, property_id_list):
+    """Q-clause matching every linkage path an Invoice may carry.
+
+    Mirror of `_receipt_scope_q` but for the Invoice table (no `invoice__`
+    prefix). Used by report queries that aggregate invoiced revenue.
+    """
+    return (
+        Q(unit_id__in=unit_id_list) |
+        Q(property_id__in=property_id_list) |
+        Q(lease__unit_id__in=unit_id_list) |
+        Q(lease__property_id__in=property_id_list)
+    )
+
+
+def _scoped_receipt_qs(unit_id_list, property_id_list):
+    """Return a clean Receipt queryset matching the landlord scope.
+
+    The naive form — `Receipt.objects.filter(_receipt_scope_q(...)).distinct()`
+    — produces SQL that Django's compiler can't combine with the
+    `_commission_expr()` subquery: the OUTER `Sum(commission_expr)` inside
+    `.aggregate()` references `OuterRef('invoice__...')`, but when the
+    parent query has its own JOINs and a DISTINCT wrapper, the alias
+    `billing_receipt` is no longer reachable from the subquery's FROM
+    clause and PostgreSQL throws
+        ProgrammingError: missing FROM-clause entry for table "billing_receipt"
+
+    Workaround: collect the matching IDs via a sub-SELECT, then return a
+    plain `Receipt.objects.filter(id__in=...)` queryset that owns no
+    joins of its own. Outer aggregations can then attach the
+    `invoice` join the subquery needs.
+    """
+    scoped_ids = Receipt.objects.filter(
+        _receipt_scope_q(unit_id_list, property_id_list)
+    ).values('id')
+    return Receipt.objects.filter(id__in=scoped_ids)
+
+
+def _scoped_invoice_qs(unit_id_list, property_id_list):
+    """Same shape as `_scoped_receipt_qs` but for Invoices."""
+    scoped_ids = Invoice.objects.filter(
+        _invoice_scope_q(unit_id_list, property_id_list)
+    ).values('id')
+    return Invoice.objects.filter(id__in=scoped_ids)
+
+
+def _aged_analysis_property_q(property_id):
+    """Q-clause matching invoices linked to `property_id` via any path."""
+    return (
+        Q(unit__property_id=property_id) |
+        Q(property_id=property_id) |
+        Q(lease__unit__property_id=property_id) |
+        Q(lease__property_id=property_id)
+    )
+
+
+def _aged_analysis_landlord_q(landlord_id):
+    """Q-clause matching invoices linked to `landlord_id` via any path."""
+    return (
+        Q(unit__property__landlord_id=landlord_id) |
+        Q(property__landlord_id=landlord_id) |
+        Q(lease__unit__property__landlord_id=landlord_id) |
+        Q(lease__property__landlord_id=landlord_id)
+    )
+
+
+def _resolve_commission_rate_pct(income_type, property_id=None):
+    """Resolve the commission rate as a Decimal percent (10.00 == 10%) for a
+    single (income_type, property) pair. Mirrors `_commission_expr()` but
+    runs in Python — used by report views that compute commission row by row
+    (e.g. CommissionReportView, IncomeExpenditureReportView).
+
+    Override beats is_commissionable (see _commission_expr docstring).
+    """
+    if not income_type:
+        return Decimal('0')
+    # Per-property override applies regardless of is_commissionable.
+    if property_id:
+        from apps.masterfile.models import PropertyIncomeCommission
+        override = PropertyIncomeCommission.objects.filter(
+            property_id=property_id, income_type_id=income_type.id,
+        ).values_list('rate', flat=True).first()
+        if override is not None:
+            return Decimal(str(override))
+    # No override — fall back to default ONLY if globally commissionable.
+    if not getattr(income_type, 'is_commissionable', False):
+        return Decimal('0')
+    return Decimal(str(income_type.default_commission_rate or 0))
+
+
+def _comparative_receipt_qs(qs):
+    """Attach the select_related / prefetch a Receipt needs for
+    `_receipt_dims` to resolve property / unit / landlord / income-type
+    without N+1 queries — including the tenant fallback for receipts that
+    carry no invoice."""
+    from django.db.models import Prefetch
+    from apps.masterfile.models import LeaseAgreement as _Lease
+    active_leases = Prefetch(
+        'tenant__leases',
+        queryset=_Lease.objects.filter(status='active').select_related(
+            'unit', 'unit__property', 'unit__property__landlord',
+            'property', 'property__landlord',
+        ),
+        to_attr='_active_leases',
+    )
+    return qs.select_related(
+        'tenant', 'tenant__unit', 'tenant__unit__property',
+        'tenant__unit__property__landlord',
+        'invoice', 'invoice__unit', 'invoice__unit__property',
+        'invoice__unit__property__landlord',
+        'invoice__property', 'invoice__property__landlord',
+        'income_type', 'bank_account',
+    ).prefetch_related(active_leases)
+
+
+def _receipt_dims(rcpt):
+    """Resolve a receipt's reporting dimensions, falling back to the
+    paying tenant when there's no invoice (direct payments).
+
+    Returns landlord/property/unit objects (or None) plus the income-type
+    key + display. The income_type code (RENT, LEVY, …) lower-cases to the
+    same key the invoice_type uses, so downstream grouping lines up.
+    """
+    unit = prop = None
+    inv = rcpt.invoice
+    if inv and inv.unit_id:
+        unit, prop = inv.unit, inv.unit.property
+    elif inv and inv.property_id:
+        prop = inv.property
+    else:
+        t = rcpt.tenant
+        if t and t.unit_id:
+            unit, prop = t.unit, t.unit.property
+        else:
+            for lease in getattr(t, '_active_leases', None) or []:
+                if lease.unit_id:
+                    unit, prop = lease.unit, lease.unit.property
+                    break
+                if lease.property_id:
+                    prop = lease.property
+                    break
+    landlord = prop.landlord if (prop and prop.landlord_id) else None
+
+    if rcpt.income_type_id:
+        key = (rcpt.income_type.code or '').lower() or 'other'
+        display = rcpt.income_type.name
+    elif inv and inv.invoice_type:
+        key = inv.invoice_type
+        display = inv.get_invoice_type_display()
+    else:
+        key, display = 'other', 'Other'
+
+    return {
+        'landlord': landlord, 'property': prop, 'unit': unit,
+        'income_type_key': key, 'income_type_display': display,
+    }
+
+
+def _exclude_non_cash_expenses_q():
+    """Q that, when passed to GeneralLedger.exclude(...), drops every entry
+    sourced from a non-cash Expense (accruals / depreciation). Used by the
+    Cash Flow Statement so its outflows reflect actual cash movements.
+    Other reports (Income Statement, Trial Balance, Balance Sheet) include
+    these because they belong on the P&L / accrued-liability side.
+    """
+    non_cash_ids = list(
+        Expense.objects.filter(expense_kind='non_cash').values_list('id', flat=True)
+    )
+    if not non_cash_ids:
+        return None
+    return Q(journal_entry__source_type='expense', journal_entry__source_id__in=non_cash_ids)
+
+
+def _aggregate_balances_from_gl(scope_filter, account_types, end_date=None, start_date=None):
+    """Aggregate per-account debit/credit totals from GL entries matching
+    the scope filter. Returns a list of dicts with code/name/account_type/
+    account_subtype/total_debit/total_credit, ordered by account code.
+    Only used for the scoped paths of Trial Balance / Balance Sheet /
+    Income Statement.
+    """
+    qs = GeneralLedger.objects.filter(scope_filter).filter(
+        account__account_type__in=account_types,
+        account__is_active=True,
+    )
+    if start_date:
+        qs = qs.filter(date__gte=start_date)
+    if end_date:
+        qs = qs.filter(date__lte=end_date)
+    return list(
+        qs.values('account__code', 'account__name', 'account__account_type',
+                  'account__account_subtype', 'account__balance_sheet_category')
+        .annotate(
+            total_debit=Coalesce(Sum('debit_amount'), Value(Decimal('0'))),
+            total_credit=Coalesce(Sum('credit_amount'), Value(Decimal('0'))),
+        )
+        .order_by('account__code')
+    )
+
+
+def _sub_account_balance_as_of(sub, as_of_date):
+    """Closing balance of a subsidiary account as at `as_of_date`.
+
+    Summed from the movements themselves rather than read off the latest
+    transaction's stored running balance. The stored balance is written
+    in posting (transaction_number) order, so a charge DATED in-period
+    but POSTED after a later-dated payment would be dropped if we picked
+    the latest-dated transaction's balance — the charge's effect simply
+    isn't in that earlier-posted row. Summing every movement dated on or
+    before the period end captures all charges and payments regardless of
+    posting order, which is the figure a Balance Sheet must show.
+
+    Consolidated (is_consolidated=False) view: a merged 'C' result carries
+    the net of its hidden source rows, so excluding the sources keeps the
+    total correct and avoids double counting.
+
+    Sign convention mirrors SubsidiaryTransaction.create_entry:
+      tenant / account_holder → debit-normal  (debit − credit)
+      landlord               → credit-normal (credit − debit)
+    """
+    agg = sub.transactions.filter(
+        date__lte=as_of_date, is_consolidated=False,
+    ).aggregate(d=Sum('debit_amount'), c=Sum('credit_amount'))
+    debit = agg['d'] or Decimal('0')
+    credit = agg['c'] or Decimal('0')
+    if sub.entity_type in ('tenant', 'account_holder'):
+        return debit - credit
+    return credit - debit
+
+
+def _cache_report(cache_key, ttl=60):
+    """
+    Decorator for caching report responses.
+    cache_key can contain {param} placeholders resolved from request.query_params.
+    """
+    def decorator(view_method):
+        def wrapper(self, request, *args, **kwargs):
+            # Build final cache key from request params
+            params = dict(request.query_params)
+            key_parts = [cache_key]
+            for k, v in sorted(params.items()):
+                key_parts.append(f"{k}={v}")
+            full_key = f"report:{':'.join(key_parts)}"
+            # Hash to keep key length safe
+            hashed_key = hashlib.md5(full_key.encode()).hexdigest()
+
+            try:
+                cached = cache.get(hashed_key)
+                if cached is not None:
+                    return Response(cached)
+            except Exception:
+                pass
+
+            response = view_method(self, request, *args, **kwargs)
+
+            try:
+                cache.set(hashed_key, response.data, ttl)
+            except Exception:
+                pass
+
+            return response
+        return wrapper
+    return decorator
+
+
+class DashboardStatsView(APIView):
+    """Dashboard KPIs and statistics. Optimized to ~5 queries instead of 15+."""
+    permission_classes = [IsAuthenticated]
+
+    @_cache_report('dashboard', ttl=300)
+    def get(self, request):
+        today = timezone.now().date()
+        month_start = today.replace(day=1)
+        thirty_days = today + timedelta(days=30)
+        six_months_ago = (today - timedelta(days=180)).replace(day=1)
+
+        # === Query 1: All property/unit stats in one query ===
+        unit_stats = Unit.objects.aggregate(
+            total_units=Count('id'),
+            vacant_units=Count('id', filter=Q(is_occupied=False)),
+        )
+        total_units = unit_stats['total_units'] or 0
+        vacant_units = unit_stats['vacant_units'] or 0
+        occupancy_rate = ((total_units - vacant_units) / total_units * 100) if total_units else 0
+
+        # === Query 2: All invoice stats in one query ===
+        inv_stats = Invoice.objects.aggregate(
+            total_invoiced=Coalesce(Sum('total_amount'), Decimal('0')),
+            monthly_invoiced=Coalesce(Sum('total_amount', filter=Q(date__gte=month_start)), Decimal('0')),
+            overdue_count=Count('id', filter=Q(status__in=['sent', 'partial'], due_date__lt=today)),
+            overdue_amount=Coalesce(Sum('balance', filter=Q(status__in=['sent', 'partial'], due_date__lt=today)), Decimal('0')),
+        )
+
+        # === Query 3: All receipt stats in one query ===
+        rcpt_stats = Receipt.objects.aggregate(
+            total_collected=Coalesce(Sum('amount'), Decimal('0')),
+            monthly_collected=Coalesce(Sum('amount', filter=Q(date__gte=month_start)), Decimal('0')),
+        )
+
+        total_invoiced = inv_stats['total_invoiced']
+        total_collected = rcpt_stats['total_collected']
+
+        # === Query 4: All entity counts in one pass ===
+        total_properties = Property.objects.count()
+        landlord_count = Landlord.objects.count()
+        tenant_count = RentalTenant.objects.count()
+        lease_stats = LeaseAgreement.objects.aggregate(
+            active=Count('id', filter=Q(status='active')),
+            expiring=Count('id', filter=Q(status='active', end_date__lte=thirty_days)),
+        )
+
+        # === Query 5 & 6: Revenue trend (already efficient aggregations) ===
+        monthly_invoices = Invoice.objects.filter(
+            date__gte=six_months_ago
+        ).annotate(
+            month=TruncMonth('date')
+        ).values('month').annotate(
+            total=Coalesce(Sum('total_amount'), Decimal('0'))
+        ).order_by('month')
+
+        monthly_receipts = Receipt.objects.filter(
+            date__gte=six_months_ago
+        ).annotate(
+            month=TruncMonth('date')
+        ).values('month').annotate(
+            total=Coalesce(Sum('amount'), Decimal('0'))
+        ).order_by('month')
+
+        invoice_by_month = {r['month'].strftime('%b'): float(r['total']) for r in monthly_invoices}
+        receipt_by_month = {r['month'].strftime('%b'): float(r['total']) for r in monthly_receipts}
+
+        revenue_trend = []
+        current = six_months_ago
+        while current <= today:
+            label = current.strftime('%b')
+            revenue_trend.append({
+                'month': label,
+                'invoiced': invoice_by_month.get(label, 0),
+                'collected': receipt_by_month.get(label, 0),
+            })
+            if current.month == 12:
+                current = current.replace(year=current.year + 1, month=1)
+            else:
+                current = current.replace(month=current.month + 1)
+
+        return Response({
+            'properties': {
+                'total': total_properties,
+                'units': total_units,
+                'vacant': vacant_units,
+                'occupancy_rate': round(occupancy_rate, 1)
+            },
+            'financial': {
+                'total_invoiced': float(total_invoiced),
+                'total_collected': float(total_collected),
+                'outstanding': float(total_invoiced - total_collected),
+                'collection_rate': round((float(total_collected) / float(total_invoiced) * 100), 1) if total_invoiced else 0
+            },
+            'monthly': {
+                'invoiced': float(inv_stats['monthly_invoiced']),
+                'collected': float(rcpt_stats['monthly_collected'])
+            },
+            'alerts': {
+                'overdue_invoices': inv_stats['overdue_count'],
+                'overdue_amount': float(inv_stats['overdue_amount']),
+                'expiring_leases': lease_stats['expiring']
+            },
+            'counts': {
+                'landlords': landlord_count,
+                'tenants': tenant_count,
+                'active_leases': lease_stats['active']
+            },
+            'revenue_trend': revenue_trend,
+        })
+
+
+class TrialBalanceReportView(APIView):
+    """Trial Balance Report."""
+    permission_classes = [IsAuthenticated]
+
+    @_cache_report('trial_balance', ttl=300)
+    def get(self, request):
+        as_of_date = request.query_params.get('as_of_date', timezone.now().date())
+        landlord_id = request.query_params.get('landlord_id')
+        property_id = request.query_params.get('property_id')
+        scope_filter = _gl_filter_for_landlord(landlord_id, property_id)
+
+        report_data = []
+        total_debits = Decimal('0')
+        total_credits = Decimal('0')
+
+        # Aggregate from GL up to `as_of_date` for both scoped and unscoped
+        # paths. Reading ChartOfAccount.current_balance is the rolled-up
+        # lifetime figure and silently ignores as_of_date — wrong for any
+        # past-date trial balance. GL aggregation is correct in both cases;
+        # scope_filter just narrows the source rows to the landlord/property.
+        gl_filter = scope_filter if scope_filter is not None else Q()
+        agg = _aggregate_balances_from_gl(
+            gl_filter,
+            account_types=['asset', 'liability', 'equity', 'revenue', 'expense'],
+            end_date=as_of_date,
+        )
+        for row in agg:
+            debit_total = row['total_debit']
+            credit_total = row['total_credit']
+            acct_type = row['account__account_type']
+            # Collapse to the account's natural side — debit-normal accounts
+            # (asset/expense) net to debit; credit-normal accounts
+            # (liability/equity/revenue) net to credit. Keeps the
+            # debit | credit two-column shape stable.
+            if acct_type in ('asset', 'expense'):
+                net = debit_total - credit_total
+                debit = net if net >= 0 else Decimal('0')
+                credit = -net if net < 0 else Decimal('0')
+            else:
+                net = credit_total - debit_total
+                credit = net if net >= 0 else Decimal('0')
+                debit = -net if net < 0 else Decimal('0')
+            if debit == 0 and credit == 0:
+                continue
+            report_data.append({
+                'code': row['account__code'],
+                'name': _bs_display_name(
+                    row['account__name'],
+                    row.get('account__account_subtype'),
+                ),
+                'subtype': row.get('account__account_subtype'),
+                'type': acct_type,
+                'debit': float(debit),
+                'credit': float(credit),
+            })
+            total_debits += debit
+            total_credits += credit
+
+        return Response({
+            'report_name': 'Trial Balance',
+            'as_of_date': str(as_of_date),
+            'accounts': report_data,
+            'scope': {
+                'landlord_id': int(landlord_id) if landlord_id else None,
+                'property_id': int(property_id) if property_id else None,
+                'is_scoped': scope_filter is not None,
+            },
+            'totals': {
+                'debits': float(total_debits),
+                'credits': float(total_credits),
+                'balanced': total_debits == total_credits,
+                'difference': float(abs(total_debits - total_credits))
+            }
+        })
+
+
+class IncomeStatementView(APIView):
+    """Profit & Loss Statement."""
+    permission_classes = [IsAuthenticated]
+
+    @_cache_report('income_statement', ttl=300)
+    def get(self, request):
+        start_date = request.query_params.get('start_date')
+        end_date = request.query_params.get('end_date', timezone.now().date())
+        landlord_id = request.query_params.get('landlord_id')
+        property_id = request.query_params.get('property_id')
+
+        scope_filter = _gl_filter_for_landlord(landlord_id, property_id)
+
+        # Cost of Sales / Gross Profit only exist on the landlord-scoped
+        # statement (commission is the landlord's Cost of Sales). The
+        # agency-wide P&L leaves these empty / null.
+        cost_of_sales_list = []
+        total_cost_of_sales = Decimal('0')
+        gross_profit = None
+
+        if scope_filter is None:
+            # Agency-wide P&L — aggregate revenue and expense GL entries
+            # within [start_date, end_date]. ChartOfAccount.current_balance
+            # is the rolled-up lifetime figure, so reading it here would
+            # silently ignore the period filter and produce an "all-time"
+            # P&L regardless of the date range the user picked.
+            agg = _aggregate_balances_from_gl(
+                Q(),
+                account_types=['revenue', 'expense'],
+                start_date=start_date,
+                end_date=end_date,
+            )
+            revenue_list, expense_list = [], []
+            total_revenue, total_expenses = Decimal('0'), Decimal('0')
+            for row in agg:
+                acct_type = row['account__account_type']
+                # Revenue is credit-normal (credits − debits); Expense is
+                # debit-normal (debits − credits). Both end up positive on
+                # the P&L lines below.
+                if acct_type == 'revenue':
+                    bal = row['total_credit'] - row['total_debit']
+                else:
+                    bal = row['total_debit'] - row['total_credit']
+                if bal == 0:
+                    continue
+                entry = {
+                    'code': row['account__code'],
+                    'name': _bs_display_name(
+                        row['account__name'],
+                        row.get('account__account_subtype'),
+                    ),
+                    'subtype': row.get('account__account_subtype'),
+                    'balance': float(bal),
+                }
+                if acct_type == 'revenue':
+                    revenue_list.append(entry)
+                    total_revenue += bal
+                else:
+                    expense_list.append(entry)
+                    total_expenses += bal
+        else:
+            # Scoped — frame the P&L from the LANDLORD's perspective, not
+            # the agency's. The agency GL records the agency's view: gross
+            # rent received goes to a landlord-trust liability, only the
+            # commission slice hits agency revenue. That's not what the
+            # landlord wants to see on their own P&L.
+            #
+            # Landlord-perspective P&L (accrual basis):
+            #   Revenue   = invoices issued on the landlord's properties,
+            #               grouped by invoice_type (rent / levy / parking…)
+            #   Expenses  = management commission charged + every expense
+            #               (cash and non-cash) attributable to the landlord
+            #
+            # Cash vs. non-cash distinction lives on Income & Expenditure /
+            # Cash Flow — the P&L includes both per accounting convention.
+            try:
+                landlord_obj = Landlord.objects.get(id=landlord_id) if landlord_id else None
+            except Landlord.DoesNotExist:
+                landlord_obj = None
+
+            # Resolve the landlord's properties + units once.
+            if landlord_obj:
+                properties = landlord_obj.properties.all()
+            elif property_id:
+                properties = Property.objects.filter(id=property_id)
+                landlord_obj = properties.first().landlord if properties.exists() else None
+            else:
+                properties = Property.objects.none()
+            if property_id:
+                properties = properties.filter(id=property_id)
+            property_id_list = list(properties.values_list('id', flat=True))
+            unit_id_list = list(
+                Unit.objects.filter(property_id__in=property_id_list).values_list('id', flat=True)
+            )
+
+            # ============================================================
+            # Landlord Income Statement (INCOME STATEMENT REPORTING spec).
+            #
+            #   Revenue        = GROSS tenant payments (receipts) for this
+            #                    landlord, split into the 8 canonical
+            #                    sub-categories, BEFORE the agent's
+            #                    commission is deducted.
+            #   Cost of Sales  = commission deducted from those revenue
+            #                    sub-categories (the cross-entity Commission
+            #                    account — agent's Revenue, landlord's COS).
+            #   Gross Profit   = Revenue − Cost of Sales.
+            #   Expenses       = operating expenses booked against the
+            #                    landlord (cash AND non-cash), below
+            #                    Gross Profit, to reach Net Income.
+            #
+            # Everything is scoped to the selected period [start, end] so
+            # the figures strictly match the month/quarter the user picked.
+            # ============================================================
+            scoped_receipts = _scoped_receipt_qs(unit_id_list, property_id_list)
+            if start_date:
+                scoped_receipts = scoped_receipts.filter(date__gte=start_date)
+            scoped_receipts = scoped_receipts.filter(date__lte=end_date)
+
+            # The 8 canonical landlord revenue sub-categories, in order.
+            # Always emitted (even at zero) so the statement is consistent.
+            REVENUE_BUCKETS = [
+                ('rent', 'Rental Income'),
+                ('levy', 'Levy Income'),
+                ('special_levy', 'Special Levy Income'),
+                ('maintenance', 'Maintenance Income'),
+                ('rates', 'Rates Income'),
+                ('parking', 'Parking Income'),
+                ('deposit', 'Deposit Income'),
+                ('vat', 'VAT Income'),
+            ]
+            _canonical = dict(REVENUE_BUCKETS)
+
+            # Classify each receipt by its revenue category. Receipts are
+            # not always tied to an invoice (direct payments), but they
+            # always carry an income_type whose code (RENT, LEVY,
+            # SPECIAL_LEVY, …) lower-cases to exactly the invoice_type key.
+            # Prefer the invoice_type when present, else fall back to the
+            # income_type code — otherwise invoice-less receipts collapse to
+            # "Other" and the named buckets read zero.
+            from django.db.models.functions import Lower
+            _cat_expr = Coalesce(
+                'invoice__invoice_type', Lower('income_type__code'),
+                output_field=CharField(),
+            )
+
+            # --- Revenue: gross receipts grouped by category. ---
+            gross_by_type = {}
+            for row in scoped_receipts.annotate(_cat=_cat_expr).values('_cat').annotate(g=Sum('amount')):
+                gross_by_type[row['_cat'] or 'other'] = row['g'] or Decimal('0')
+
+            revenue_list = []
+            total_revenue = Decimal('0')
+            for key, label in REVENUE_BUCKETS:
+                amt = gross_by_type.get(key, Decimal('0'))
+                revenue_list.append({'code': '', 'name': label, 'balance': float(amt)})
+                total_revenue += amt
+            # Payment types outside the canonical 8 (penalty, utility,
+            # other) are surfaced as Other Income so nothing is dropped.
+            other_income = sum(
+                (v for k, v in gross_by_type.items() if k not in _canonical),
+                Decimal('0'),
+            )
+            if other_income:
+                revenue_list.append({'code': '', 'name': 'Other Income', 'balance': float(other_income)})
+                total_revenue += other_income
+
+            # --- Cost of Sales: commission deducted per revenue bucket. ---
+            commission_by_type = {}
+            for row in scoped_receipts.annotate(_cat=_cat_expr).values('_cat').annotate(
+                c=Sum(_commission_expr())
+            ):
+                commission_by_type[row['_cat'] or 'other'] = row['c'] or Decimal('0')
+
+            for key, label in REVENUE_BUCKETS:
+                amt = commission_by_type.get(key, Decimal('0'))
+                if amt == 0:
+                    continue
+                cost_of_sales_list.append({
+                    'code': '',
+                    'name': f'Commission on {label}',
+                    'balance': float(amt),
+                    'group': 'cost_of_sales',
+                })
+                total_cost_of_sales += amt
+            other_commission = sum(
+                (v for k, v in commission_by_type.items() if k not in _canonical),
+                Decimal('0'),
+            )
+            if other_commission:
+                cost_of_sales_list.append({
+                    'code': '', 'name': 'Commission on Other Income',
+                    'balance': float(other_commission), 'group': 'cost_of_sales',
+                })
+                total_cost_of_sales += other_commission
+
+            gross_profit = total_revenue - total_cost_of_sales
+
+            # --- Operating expenses booked against the landlord (cash AND
+            #     non-cash accruals). Commission is NOT here — it's Cost of
+            #     Sales above. Accruals belong on the P&L the moment they're
+            #     approved, not when settled. ---
+            expense_qs = Expense.objects.filter(
+                Q(landlord_id=landlord_obj.id) | Q(payee_type='landlord', payee_id=landlord_obj.id)
+            ) if landlord_obj else Expense.objects.none()
+            expense_qs = expense_qs.filter(status__in=['approved', 'paid'])
+            if start_date:
+                expense_qs = expense_qs.filter(date__gte=start_date)
+            expense_qs = expense_qs.filter(date__lte=end_date)
+
+            expense_list = []
+            total_expenses = Decimal('0')
+            grouped = expense_qs.values(
+                'expense_category__name', 'expense_category__gl_account__code', 'expense_kind',
+            ).annotate(t=Sum('amount')).order_by('expense_category__name', 'expense_kind')
+            for row in grouped:
+                amt = row['t'] or Decimal('0')
+                if amt == 0:
+                    continue
+                base_name = row['expense_category__name'] or 'Other Expense'
+                suffix = ' (accrued)' if row['expense_kind'] == 'non_cash' else ''
+                expense_list.append({
+                    'code': row['expense_category__gl_account__code'] or '',
+                    'name': f'{base_name}{suffix}',
+                    'balance': float(amt),
+                })
+                total_expenses += amt
+
+        # Net income: from Gross Profit on the landlord statement; straight
+        # revenue − expenses on the agency-wide statement.
+        if gross_profit is not None:
+            net_income = gross_profit - total_expenses
+        else:
+            net_income = total_revenue - total_expenses
+
+        return Response({
+            'report_name': 'Income Statement',
+            'period': {
+                'start': start_date,
+                'end': str(end_date)
+            },
+            'scope': {
+                'landlord_id': int(landlord_id) if landlord_id else None,
+                'property_id': int(property_id) if property_id else None,
+                'is_scoped': scope_filter is not None,
+            },
+            'revenue': {
+                'accounts': revenue_list,
+                'total': float(total_revenue)
+            },
+            'cost_of_sales': {
+                'accounts': cost_of_sales_list,
+                'total': float(total_cost_of_sales)
+            },
+            'gross_profit': float(gross_profit) if gross_profit is not None else None,
+            'expenses': {
+                'accounts': expense_list,
+                'total': float(total_expenses)
+            },
+            'net_income': float(net_income),
+            'is_profit': net_income >= 0
+        })
+
+
+# Agent-only liability accounts (per BALANCE SHEET REPORTING spec).
+# These ten accounts exist in the agent's chart to maintain transaction
+# flow but never belong on a landlord-scoped Balance Sheet — they're
+# the agent's own liabilities, not the landlord's. Match on name so we
+# catch every seed variant (codes drift between onboarding paths).
+_AGENT_LIABILITY_NAME_FRAGMENTS = (
+    'unpaid rent', 'unpaid levy', 'unpaid rates', 'unpaid maintenance',
+    'unpaid parking', 'unpaid special levy', 'unpaid vat',
+    'unpaid deposit',  # also catches "unpaid deposits"
+    'vat payable', 'commission payable',
+    'deferred revenue',  # synonym sometimes used for Unpaid Rent
+    'landlord trust',  # Landlord Trust Payable — agent's mirror of trust assets
+)
+
+
+def _is_agent_liability(name):
+    """True when `name` matches one of the 10 agent-only liability
+    accounts described in the spec. Substring match because the chart
+    of accounts has multiple seed variants ("Unpaid Rent", "Unpaid Rent
+    (Deferred Revenue)", "Unpaid Rent USD", etc.)."""
+    n = (name or '').lower()
+    return any(f in n for f in _AGENT_LIABILITY_NAME_FRAGMENTS)
+
+
+def _bs_display_name(name, subtype):
+    """Display name override for report account rows.
+
+    The COA migration (0016) renames the commission-VAT liability from
+    "VAT Payable (Commission)" to "Commission Payable (Commission)".
+    This helper is a safety net for tenants where the migration hasn't
+    landed yet — it does the same rename at display time. The plain
+    "VAT Payable" account (code 2100) is left untouched.
+    """
+    name = (name or '').strip()
+    if name == 'VAT Payable (Commission)':
+        return 'Commission Payable (Commission)'
+    # `subtype` arg kept for API stability; not consulted now that the
+    # DB is the source of truth for the rename.
+    _ = subtype
+    return name
+
+
+class BalanceSheetView(APIView):
+    """Balance Sheet Report."""
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        # TEMPORARY DIAGNOSTIC: surface the full traceback + tenant
+        # context on every 500 from this view so we can pin down the
+        # production-only exception that the generic handler masks.
+        try:
+            return self._get_impl(request)
+        except Exception as exc:
+            import traceback
+            from django.db import connection as _conn
+            tb = traceback.format_exc()
+            logger.exception('BalanceSheetView crashed')
+            table_check: dict = {}
+            try:
+                with _conn.cursor() as _cur:
+                    for tbl in (
+                        'accounting_generalledger',
+                        'accounting_chartofaccount',
+                        'accounting_openingbalance',
+                        'masterfile_landlord',
+                    ):
+                        _cur.execute(
+                            "SELECT EXISTS (SELECT FROM information_schema.tables "
+                            "WHERE table_schema = current_schema() AND table_name = %s)",
+                            [tbl],
+                        )
+                        row = _cur.fetchone()
+                        table_check[tbl] = bool(row[0]) if row else False
+            except Exception as _ce:
+                table_check['_error'] = str(_ce)
+            return Response(
+                {
+                    'error': str(exc),
+                    'type': exc.__class__.__name__,
+                    'traceback': tb.splitlines()[-40:],
+                    'query_params': dict(request.query_params),
+                    'http_host': request.META.get('HTTP_HOST', ''),
+                    'x_tenant_subdomain_header': request.META.get(
+                        'HTTP_X_TENANT_SUBDOMAIN', ''
+                    ),
+                    'tables_present_on_current_schema': table_check,
+                },
+                status=500,
+            )
+
+    @_cache_report('balance_sheet', ttl=300)
+    def _get_impl(self, request):
+        as_of_date = request.query_params.get('as_of_date', timezone.now().date())
+        landlord_id = request.query_params.get('landlord_id')
+        property_id = request.query_params.get('property_id')
+
+        scope_filter = _gl_filter_for_landlord(landlord_id, property_id)
+
+        asset_list, liability_list, equity_list = [], [], []
+        total_assets = Decimal('0')
+        total_liabilities = Decimal('0')
+        total_equity = Decimal('0')
+        # `equity_method` is how the equity total was reached:
+        #   - 'gl_derived'         (agency-wide)    : equity lines come from
+        #                          posted equity-type GL accounts +
+        #                          retained earnings = Σrevenue − Σexpense.
+        #   - 'balancing_residual' (landlord-scoped): equity = assets − liabilities
+        #                          (a plug, because there's no per-landlord
+        #                          equity account in the agency's chart).
+        # The frontend renders a small "Plug — calculated as A − L" badge on
+        # the equity row when the method is balancing_residual so the user
+        # knows the number isn't sourced from posted entries.
+        equity_method = 'gl_derived'
+        equity_components: dict | None = None
+        # `sub_categories_*` are the spec'd 4-bucket structure used on
+        # landlord-scoped sheets. Agency-wide sheets leave them as None;
+        # the frontend then falls back to the flat `accounts` list.
+        sub_categories_assets: list | None = None
+        sub_categories_liabilities: list | None = None
+
+        if scope_filter is None:
+            # Agency-wide Balance Sheet — aggregate from GL up to as_of_date.
+            # ChartOfAccount.current_balance is lifetime and ignores
+            # as_of_date, so a past-date sheet would otherwise be wrong.
+            agg = _aggregate_balances_from_gl(
+                Q(),
+                account_types=['asset', 'liability', 'equity'],
+                end_date=as_of_date,
+            )
+            for row in agg:
+                acct_type = row['account__account_type']
+                # Asset is debit-normal; liability/equity are credit-normal.
+                if acct_type == 'asset':
+                    bal = row['total_debit'] - row['total_credit']
+                else:
+                    bal = row['total_credit'] - row['total_debit']
+                if bal == 0:
+                    continue
+                entry = {
+                    'code': row['account__code'],
+                    'name': _bs_display_name(
+                        row['account__name'],
+                        row.get('account__account_subtype'),
+                    ),
+                    'subtype': row.get('account__account_subtype') or '',
+                    'balance': float(bal),
+                }
+                if acct_type == 'asset':
+                    asset_list.append(entry)
+                    total_assets += bal
+                elif acct_type == 'liability':
+                    liability_list.append(entry)
+                    total_liabilities += bal
+                else:
+                    equity_list.append(entry)
+                    total_equity += bal
+
+            # Retained Earnings — accumulated profit (revenue − expense) up
+            # to as_of_date. The agency chart of accounts does not run a
+            # period-close that posts P&L into a Retained Earnings ledger
+            # account, so without this line the sheet would be off by the
+            # period net income for every date except inception. Standard
+            # accounting closing-the-books move performed in software.
+            re_agg = _aggregate_balances_from_gl(
+                Q(),
+                account_types=['revenue', 'expense'],
+                end_date=as_of_date,
+            )
+            revenue_total = sum(
+                (r['total_credit'] - r['total_debit'])
+                for r in re_agg if r['account__account_type'] == 'revenue'
+            )
+            expense_total = sum(
+                (r['total_debit'] - r['total_credit'])
+                for r in re_agg if r['account__account_type'] == 'expense'
+            )
+            retained_earnings = (revenue_total or Decimal('0')) - (expense_total or Decimal('0'))
+            if retained_earnings != 0:
+                equity_list.append({
+                    'code': '',
+                    'name': 'Retained Earnings',
+                    'balance': float(retained_earnings),
+                })
+                total_equity += retained_earnings
+        else:
+            # ============================================================
+            # Landlord-scoped Balance Sheet — built per the spec from
+            # SUB-ACCOUNT balances, not from agency GL aggregates.
+            #
+            # Current Assets (always 4, even when zero):
+            #   1. Funds Held in Trust  = Σ landlord sub-account POSITIVE
+            #                              balances (rent, levy, rates,
+            #                              maintenance, parking, deposit,
+            #                              VAT, special levy)
+            #   2. Lessees Arrears       = Σ tenant/account-holder
+            #                              POSITIVE balances (debit-normal,
+            #                              positive = tenant owes us)
+            #   3. Prepayments           = Σ paid Expense rows tagged as
+            #                              prepaid (or COA Prepaid Expenses)
+            #   4. Other Current Assets  = remaining non-bank assets from
+            #                              the landlord-scoped GL
+            #
+            # Current Liabilities (always 4, even when zero):
+            #   1. Funds Owed By Trust   = Σ landlord sub-account NEGATIVE
+            #                              balances (overdrawn → liability)
+            #   2. Lessees Prepayments   = Σ tenant/account-holder NEGATIVE
+            #                              balances (tenant paid ahead)
+            #   3. Accruals              = Σ unpaid AccruedExpense for
+            #                              this landlord
+            #   4. Other Current Liab.   = remaining liabilities, excluding
+            #                              the 10 agent-only accounts
+            #                              filtered by _is_agent_liability.
+            # ============================================================
+            from apps.accounting.models import (
+                SubsidiaryAccount, AccruedExpense,
+            )
+
+            sub_categories_assets = []
+            sub_categories_liabilities = []
+
+            # --- Landlord sub-accounts (funds held / funds owed) ---
+            # Balance "as of date" = net of every movement dated on/before
+            # as_of_date (see _sub_account_balance_as_of). If no movements,
+            # the balance is 0.
+            landlord_subs = SubsidiaryAccount.objects.filter(
+                landlord_id=int(landlord_id), entity_type='landlord',
+            )
+
+            funds_held_total = Decimal('0')
+            funds_owed_total = Decimal('0')
+            funds_held_breakdown = []
+            funds_owed_breakdown = []
+            for sub in landlord_subs:
+                # Strict period rule: closing balance as at the report date,
+                # summed from every movement dated on/before as_of_date so
+                # nothing is dropped by posting order.
+                bal = _sub_account_balance_as_of(sub, as_of_date)
+                # Landlord accounts are credit-normal: positive balance
+                # = credit balance = agent holds cash for landlord.
+                if bal > 0:
+                    funds_held_total += bal
+                    funds_held_breakdown.append({
+                        'code': sub.code,
+                        'category': sub.category,
+                        'currency': sub.currency,
+                        'balance': float(bal),
+                    })
+                elif bal < 0:
+                    overdraft = abs(bal)
+                    funds_owed_total += overdraft
+                    funds_owed_breakdown.append({
+                        'code': sub.code,
+                        'category': sub.category,
+                        'currency': sub.currency,
+                        'balance': float(overdraft),
+                    })
+
+            # --- Tenant sub-accounts (arrears / prepayments) ---
+            # Tenants are linked to the landlord via the lease chain.
+            # `_invoice_scope_q`-style logic resolved to a set of tenant IDs.
+            from apps.masterfile.models import LeaseAgreement as _Lease
+            tenant_ids = set(
+                _Lease.objects.filter(
+                    Q(unit__property__landlord_id=landlord_id) |
+                    Q(property__landlord_id=landlord_id)
+                ).values_list('tenant_id', flat=True)
+            )
+            if property_id:
+                tenant_ids &= set(
+                    _Lease.objects.filter(
+                        Q(unit__property_id=property_id) |
+                        Q(property_id=property_id)
+                    ).values_list('tenant_id', flat=True)
+                )
+
+            tenant_subs = SubsidiaryAccount.objects.filter(
+                tenant_id__in=list(tenant_ids),
+                entity_type__in=['tenant', 'account_holder'],
+            )
+
+            lessees_arrears_total = Decimal('0')
+            lessees_prepayments_total = Decimal('0')
+            arrears_breakdown = []
+            prepayments_breakdown = []
+            for sub in tenant_subs:
+                # Strict period rule: the tenant's CLOSING balance as at the
+                # report date — summed from every charge and payment dated
+                # on/before as_of_date. Reading the latest transaction's
+                # stored balance would silently drop a charge dated in-period
+                # but posted after a later-dated payment; summing the
+                # movements keeps every charge in the figure.
+                bal = _sub_account_balance_as_of(sub, as_of_date)
+                # Tenant/account_holder accounts are debit-normal:
+                # positive = tenant owes us (arrears), negative = prepaid.
+                if bal > 0:
+                    lessees_arrears_total += bal
+                    arrears_breakdown.append({
+                        'tenant_id': sub.tenant_id,
+                        'tenant_code': sub.code,
+                        'tenant_name': sub.name,
+                        'balance': float(bal),
+                    })
+                elif bal < 0:
+                    prepaid = abs(bal)
+                    lessees_prepayments_total += prepaid
+                    prepayments_breakdown.append({
+                        'tenant_id': sub.tenant_id,
+                        'tenant_code': sub.code,
+                        'tenant_name': sub.name,
+                        'balance': float(prepaid),
+                    })
+
+            # --- Accruals (Layer 2 non-cash expenses awaiting payment) ---
+            accruals_total = AccruedExpense.objects.filter(
+                landlord_id=int(landlord_id),
+                status='posted',  # 'cleared' means already paid
+                date__lte=as_of_date,
+            ).aggregate(t=Sum('amount'))['t'] or Decimal('0')
+
+            # --- Prepayments / Other CA / Other CL: walk the GL for the
+            #     landlord scope and bucket the rows. Anything that isn't
+            #     a sub-account-tracked balance falls here. ---
+            agg = _aggregate_balances_from_gl(
+                scope_filter,
+                account_types=['asset', 'liability', 'equity'],
+                end_date=as_of_date,
+            )
+
+            from apps.accounting.models import ChartOfAccount as _CoA
+            # Bank AND cash GL accounts are the agency's record of the trust
+            # cash. On a landlord-scoped sheet that same money is already
+            # presented as Funds Held in Trust (derived from the landlord's
+            # sub-ledger), so excluding them here prevents a duplicate
+            # "Cash on Hand" line double-counting the trust balance.
+            trust_cash_codes = set(
+                _CoA.objects.filter(account_subtype__in=['bank', 'cash'])
+                .values_list('code', flat=True)
+            )
+
+            # ============================================================
+            # Strict sub-category placement (BS SECOND PROMPT spec).
+            #
+            # Every asset/liability GL account is reported under the
+            # `balance_sheet_category` the user picked at creation time.
+            # We NEVER guess by name/subtype any more. An account with no
+            # category (legacy rows) falls into the matching 'Other
+            # Current ...' bucket so nothing silently disappears.
+            #
+            # The four sub-ledger-derived buckets (Funds Held, Lessees
+            # Arrears, Funds Owed, Lessees Prepayments) are pre-seeded
+            # with their sub-account totals; an explicitly-assigned GL
+            # account is ADDED on top (the user's deliberate choice).
+            # Bank and AR GL rows are still skipped because the trust
+            # sub-ledger already represents that same cash / receivable.
+            # ============================================================
+            asset_buckets = {
+                'funds_held_in_trust': {
+                    'name': 'Funds Held in Trust',
+                    'total': funds_held_total,
+                    'breakdown': funds_held_breakdown,
+                    'description': 'Positive landlord sub-account balances (cash held on behalf)',
+                },
+                'lessees_arrears': {
+                    'name': 'Lessees Arrears',
+                    'total': lessees_arrears_total,
+                    'breakdown': arrears_breakdown,
+                    'description': 'Sum of each tenant/account-holder outstanding balance as at the report date',
+                },
+                'prepayments': {
+                    'name': 'Prepayments',
+                    'total': Decimal('0'),
+                    'breakdown': [],
+                    'description': 'Expenses paid in advance',
+                },
+                'other_current_assets': {
+                    'name': 'Other Current Assets',
+                    'total': Decimal('0'),
+                    'breakdown': [],
+                    'description': 'Asset accounts classified as Other Current Assets at creation',
+                },
+            }
+            liability_buckets = {
+                'funds_owed_by_trust': {
+                    'name': 'Funds Owed by Trust',
+                    'total': funds_owed_total,
+                    'breakdown': funds_owed_breakdown,
+                    'description': 'Negative landlord sub-account balances (overdrawn)',
+                },
+                'lessees_prepayments': {
+                    'name': 'Lessees Prepayments',
+                    'total': lessees_prepayments_total,
+                    'breakdown': prepayments_breakdown,
+                    'description': 'Sum of each tenant/account-holder credit balance (paid ahead) as at the report date',
+                },
+                'accruals': {
+                    'name': 'Accruals',
+                    'total': accruals_total,
+                    'breakdown': [],
+                    'description': 'Accrued expenses awaiting payment',
+                },
+                'other_current_liabilities': {
+                    'name': 'Other Current Liabilities',
+                    'total': Decimal('0'),
+                    'breakdown': [],
+                    'description': 'Liability accounts classified as Other Current Liabilities at creation',
+                },
+            }
+
+            for row in agg:
+                acct_type = row['account__account_type']
+                code = row['account__code']
+                subtype = row.get('account__account_subtype') or ''
+                category = row.get('account__balance_sheet_category') or ''
+                name = _bs_display_name(row['account__name'], subtype)
+                debit_total = row['total_debit']
+                credit_total = row['total_credit']
+
+                if acct_type == 'asset':
+                    bal = debit_total - credit_total
+                    if bal == 0:
+                        continue
+                    # Bank/cash rows are already represented by the
+                    # sub-account-derived Funds Held in Trust — skip so a
+                    # "Cash on Hand" GL line doesn't duplicate the trust.
+                    if code in trust_cash_codes:
+                        continue
+                    # AR rows are already represented by the
+                    # sub-account-derived Lessees Arrears — skip.
+                    if subtype == 'accounts_receivable':
+                        continue
+                    # Strict placement: use the chosen bucket, else Other.
+                    bucket_key = category if category in asset_buckets else 'other_current_assets'
+                    asset_buckets[bucket_key]['total'] += bal
+                    asset_buckets[bucket_key]['breakdown'].append({
+                        'code': code, 'name': name,
+                        'subtype': subtype, 'balance': float(bal),
+                    })
+                elif acct_type == 'liability':
+                    bal = credit_total - debit_total
+                    if bal == 0:
+                        continue
+                    # The 10 agent-only liabilities never appear on a
+                    # landlord-scoped sheet per the BS REPORTING spec.
+                    if _is_agent_liability(name):
+                        continue
+                    # Strict placement: use the chosen bucket, else Other.
+                    bucket_key = category if category in liability_buckets else 'other_current_liabilities'
+                    liability_buckets[bucket_key]['total'] += bal
+                    liability_buckets[bucket_key]['breakdown'].append({
+                        'code': code, 'name': name,
+                        'subtype': subtype, 'balance': float(bal),
+                    })
+                # Equity rows from GL are ignored under scope — landlord
+                # equity is derived below as the balancing residual.
+
+            # --- Build the structured 4-sub-category sections per spec.
+            #     ALWAYS emit all 4 (fixed order) even when totals are
+            #     zero so the UI can render the sub-categories. ---
+            def _finalize(bucket):
+                return {
+                    'name': bucket['name'],
+                    'total': float(bucket['total']),
+                    'breakdown': bucket['breakdown'],
+                    'description': bucket['description'],
+                }
+
+            sub_categories_assets = [
+                _finalize(asset_buckets['funds_held_in_trust']),
+                _finalize(asset_buckets['lessees_arrears']),
+                _finalize(asset_buckets['prepayments']),
+                _finalize(asset_buckets['other_current_assets']),
+            ]
+            sub_categories_liabilities = [
+                _finalize(liability_buckets['funds_owed_by_trust']),
+                _finalize(liability_buckets['lessees_prepayments']),
+                _finalize(liability_buckets['accruals']),
+                _finalize(liability_buckets['other_current_liabilities']),
+            ]
+
+            # Mirror the sub-category totals into the legacy flat
+            # `accounts` shape so the existing UI still has data to
+            # render. The new `sections` field is what spec-compliant
+            # UI should consume.
+            for sc in sub_categories_assets:
+                if sc['total'] != 0:
+                    asset_list.append({
+                        'code': '',
+                        'name': sc['name'],
+                        'subtype': 'sub_category',
+                        'balance': sc['total'],
+                    })
+                    total_assets += Decimal(str(sc['total']))
+            for sc in sub_categories_liabilities:
+                if sc['total'] != 0:
+                    liability_list.append({
+                        'code': '',
+                        'name': sc['name'],
+                        'subtype': 'sub_category',
+                        'balance': sc['total'],
+                    })
+                    total_liabilities += Decimal(str(sc['total']))
+
+            # Equity = Assets - Liabilities (always shown).
+            derived_equity = total_assets - total_liabilities
+            equity_list = [{
+                'code': '',
+                'name': "Owner's Equity (Net Worth)",
+                'subtype': 'owner_equity_plug',
+                'balance': float(derived_equity),
+            }]
+            total_equity = derived_equity
+            equity_method = 'balancing_residual'
+            equity_components = {
+                'total_assets': float(total_assets),
+                'total_liabilities': float(total_liabilities),
+                'derived_equity': float(derived_equity),
+                'funds_held_in_trust': float(funds_held_total),
+                'funds_owed_by_trust': float(funds_owed_total),
+                'lessees_arrears': float(lessees_arrears_total),
+                'lessees_prepayments': float(lessees_prepayments_total),
+                'accruals': float(accruals_total),
+            }
+
+        # ------------------------------------------------------------
+        # Notes / breakdowns — landlord-scoped only.
+        #
+        # Composed for the landlord-facing statement: each note explains
+        # WHERE a number on the sheet came from. Bank-statement style.
+        #
+        #   per_property               — splits each line across the
+        #                                landlord's properties (only
+        #                                meaningful when there are 2+).
+        #   trust_composition          — receipts in, commission out,
+        #                                operating expenses paid, landlord
+        #                                remittances → Funds Held in Trust.
+        #   equity_reconciliation      — opening equity + period net income
+        #                                − drawings = closing equity.
+        #   accrued_expenses_by_category — splits the accrued-expense
+        #                                liability into expense categories.
+        # ------------------------------------------------------------
+        breakdowns = {}
+        if scope_filter is not None and landlord_id:
+            try:
+                landlord_obj = Landlord.objects.get(id=landlord_id)
+            except Landlord.DoesNotExist:
+                landlord_obj = None
+
+            if landlord_obj:
+                _properties = landlord_obj.properties.all()
+                if property_id:
+                    _properties = _properties.filter(id=property_id)
+                _properties = list(_properties)
+                _property_id_list = [p.id for p in _properties]
+                _units_qs = Unit.objects.filter(property_id__in=_property_id_list)
+                _unit_id_list = list(_units_qs.values_list('id', flat=True))
+
+                # ---- Trust composition (inception → as_of_date) ----
+                _all_receipts_qs = _scoped_receipt_qs(_unit_id_list, _property_id_list).filter(
+                    date__lte=as_of_date,
+                )
+                _rcpt_total = _all_receipts_qs.aggregate(t=Sum('amount'))['t'] or Decimal('0')
+                _comm_total = _all_receipts_qs.aggregate(t=Sum(_commission_expr()))['t'] or Decimal('0')
+                # Per-income-type split of trust commission so the note
+                # can show "Rent commission $X · Maintenance commission $Y
+                # · Parking commission $Z" beneath the rolled-up total.
+                _comm_by_type_qs = list(
+                    _all_receipts_qs.values(
+                        'income_type__id', 'income_type__name', 'income_type__code',
+                    ).annotate(commission=Sum(_commission_expr()))
+                    .order_by('income_type__name')
+                )
+                _comm_by_type = [
+                    {
+                        'income_type_id': r['income_type__id'],
+                        'income_type_name': r['income_type__name'] or 'Other',
+                        'income_type_code': r['income_type__code'] or '',
+                        'amount': float(r['commission'] or Decimal('0')),
+                    }
+                    for r in _comm_by_type_qs
+                    if (r['commission'] or Decimal('0')) != 0
+                ]
+
+                _operating_exp_total = Expense.objects.filter(
+                    landlord_id=landlord_obj.id,
+                    status='paid',
+                    date__lte=as_of_date,
+                ).exclude(expense_kind='non_cash').exclude(
+                    expense_type='landlord_payment'
+                ).aggregate(t=Sum('amount'))['t'] or Decimal('0')
+
+                _remittance_total = Expense.objects.filter(
+                    landlord_id=landlord_obj.id,
+                    expense_type='landlord_payment',
+                    status='paid',
+                    date__lte=as_of_date,
+                ).exclude(expense_kind='non_cash').aggregate(t=Sum('amount'))['t'] or Decimal('0')
+
+                breakdowns['trust_composition'] = {
+                    'receipts_collected': float(_rcpt_total),
+                    'commission_charged': float(_comm_total),
+                    'commission_charged_by_type': _comm_by_type,
+                    'operating_expenses_paid': float(_operating_exp_total),
+                    'landlord_remittances': float(_remittance_total),
+                    'funds_held_in_trust': float(
+                        _rcpt_total - _comm_total - _operating_exp_total - _remittance_total
+                    ),
+                }
+
+                # ---- Per-property breakdown ----
+                # Only build when the landlord has 2+ properties in scope.
+                if len(_properties) >= 2:
+                    pp_rows = []
+                    for prop in _properties:
+                        _prop_units = list(_units_qs.filter(property_id=prop.id).values_list('id', flat=True))
+                        _prop_rcpt_qs = Receipt.objects.filter(
+                            Q(invoice__unit_id__in=_prop_units) |
+                            Q(invoice__property_id=prop.id),
+                            date__lte=as_of_date,
+                        )
+                        _prop_rcpt = _prop_rcpt_qs.aggregate(t=Sum('amount'))['t'] or Decimal('0')
+                        _prop_comm = _prop_rcpt_qs.aggregate(t=Sum(_commission_expr()))['t'] or Decimal('0')
+                        # Expense is landlord-LEVEL — has no unit / property
+                        # FK on the model itself. Per-property expense split
+                        # isn't possible from the DB; we leave these at 0
+                        # rather than crash on a FieldError. (If you need
+                        # per-property expense attribution add a property
+                        # FK to Expense and backfill.)
+                        _prop_op_exp = Decimal('0')
+                        _prop_remit = Decimal('0')
+                        _prop_accrued = Decimal('0')
+                        _prop_receivables = Invoice.objects.filter(
+                            Q(unit__property_id=prop.id) | Q(property_id=prop.id),
+                            date__lte=as_of_date,
+                            balance__gt=0,
+                        ).aggregate(t=Sum('balance'))['t'] or Decimal('0')
+
+                        pp_rows.append({
+                            'property_id': prop.id,
+                            'property_name': prop.name,
+                            'funds_held_in_trust': float(
+                                _prop_rcpt - _prop_comm - _prop_op_exp - _prop_remit
+                            ),
+                            'tenant_receivables': float(_prop_receivables),
+                            'accrued_expenses': float(_prop_accrued),
+                        })
+                    breakdowns['per_property'] = pp_rows
+
+                # ---- Accrued expenses ----
+                # Two views on the same data so the frontend can render
+                # category subtotals AND the underlying line items with
+                # their suppliers (City of Harare, ZESA, etc.) — landlords
+                # want to see WHO they owe, not just the totals.
+                _accrued_qs = Expense.objects.filter(
+                    landlord_id=landlord_obj.id,
+                    expense_kind='non_cash',
+                    status__in=['approved', 'paid'],
+                    date__lte=as_of_date,
+                ).select_related(
+                    'expense_category', 'supplier',
+                ).order_by('expense_category__name', 'date')
+
+                _accrued_by_cat = list(
+                    _accrued_qs.values('expense_category__name').annotate(
+                        amount=Sum('amount')
+                    ).order_by('expense_category__name')
+                )
+                if _accrued_by_cat:
+                    breakdowns['accrued_expenses_by_category'] = [
+                        {
+                            'category': r['expense_category__name'] or 'Uncategorised',
+                            'amount': float(r['amount'] or Decimal('0')),
+                        }
+                        for r in _accrued_by_cat if (r['amount'] or 0) != 0
+                    ]
+
+                _accrued_entries = []
+                for exp in _accrued_qs:
+                    if exp.amount in (None, 0):
+                        continue
+                    # Supplier-style payee preference order:
+                    #   structured Supplier FK → legacy payee_name string →
+                    #   Expense.description / supplier_name fallbacks → '—'
+                    supplier_name = ''
+                    supplier_code = ''
+                    if exp.supplier_id and exp.supplier:
+                        supplier_name = exp.supplier.name
+                        supplier_code = exp.supplier.code
+                    elif getattr(exp, 'payee_name', None):
+                        supplier_name = exp.payee_name
+                    _accrued_entries.append({
+                        'id': exp.id,
+                        'date': str(exp.date),
+                        'category': (
+                            exp.expense_category.name if exp.expense_category_id else 'Uncategorised'
+                        ),
+                        'supplier_name': supplier_name or '—',
+                        'supplier_code': supplier_code,
+                        'description': exp.description or '',
+                        'reference': exp.reference or '',
+                        'currency': exp.currency,
+                        'amount': float(exp.amount),
+                    })
+                if _accrued_entries:
+                    breakdowns['accrued_expenses_detail'] = _accrued_entries
+
+                # ---- Equity reconciliation (year-to-date) ----
+                # "Period" defined as 1 Jan of as_of_date.year → as_of_date.
+                # Opening equity = funds at YTD start; closing = derived equity.
+                _as_of = as_of_date if isinstance(as_of_date, date) else date.fromisoformat(str(as_of_date))
+                _period_start = _as_of.replace(month=1, day=1)
+                _opening_cutoff = _period_start - timedelta(days=1)
+
+                _open_rcpt_qs = _scoped_receipt_qs(_unit_id_list, _property_id_list).filter(
+                    date__lte=_opening_cutoff,
+                )
+                _open_rcpt = _open_rcpt_qs.aggregate(t=Sum('amount'))['t'] or Decimal('0')
+                _open_comm = _open_rcpt_qs.aggregate(t=Sum(_commission_expr()))['t'] or Decimal('0')
+                _open_exp = Expense.objects.filter(
+                    landlord_id=landlord_obj.id,
+                    status='paid',
+                    date__lte=_opening_cutoff,
+                ).exclude(expense_kind='non_cash').aggregate(t=Sum('amount'))['t'] or Decimal('0')
+                _opening_equity = _open_rcpt - _open_comm - _open_exp
+
+                # Period net income — invoiced revenue minus operating
+                # expenses + commission within the period. Mirrors the
+                # Income Statement's accrual frame.
+                _period_invoice = _scoped_invoice_qs(_unit_id_list, _property_id_list).filter(
+                    date__gte=_period_start,
+                    date__lte=as_of_date,
+                ).aggregate(t=Sum('amount'))['t'] or Decimal('0')
+
+                _period_rcpt_qs = _scoped_receipt_qs(_unit_id_list, _property_id_list).filter(
+                    date__gte=_period_start, date__lte=as_of_date,
+                )
+                _period_comm = _period_rcpt_qs.aggregate(t=Sum(_commission_expr()))['t'] or Decimal('0')
+
+                _period_expenses = Expense.objects.filter(
+                    landlord_id=landlord_obj.id,
+                    status__in=['approved', 'paid'],
+                    date__gte=_period_start, date__lte=as_of_date,
+                ).exclude(expense_type='landlord_payment').aggregate(t=Sum('amount'))['t'] or Decimal('0')
+
+                _period_net_income = _period_invoice - _period_comm - _period_expenses
+
+                _period_drawings = Expense.objects.filter(
+                    landlord_id=landlord_obj.id,
+                    expense_type='landlord_payment',
+                    status='paid',
+                    date__gte=_period_start, date__lte=as_of_date,
+                ).aggregate(t=Sum('amount'))['t'] or Decimal('0')
+
+                breakdowns['equity_reconciliation'] = {
+                    'period_start': str(_period_start),
+                    'period_end': str(as_of_date),
+                    'opening_equity': float(_opening_equity),
+                    'period_net_income': float(_period_net_income),
+                    'drawings': float(_period_drawings),
+                    'closing_equity': float(_opening_equity + _period_net_income - _period_drawings),
+                }
+
+                # ---- Opening balances adjustments ----
+                # Opening Layer entries don't move cash, so they don't
+                # affect trust composition or the cash-basis equity
+                # reconciliation above. They DO show up on the Balance
+                # Sheet itself (assets/liabilities) via the GL filter
+                # extension to source_type='opening_balance'. Surface
+                # the breakdown here so the reader can see exactly which
+                # pre-existing balances were brought in via the Opening
+                # Layer for this landlord.
+                # Defensive: this block can fail mid-deploy if the
+                # supplier FK column hasn't been migrated yet on this
+                # tenant schema (race between code rollout and tenant
+                # migrations). Wrap so the rest of the Balance Sheet
+                # still renders; we just skip the OB note in that case.
+                from apps.accounting.models import OpeningBalance
+                from django.db import ProgrammingError, OperationalError
+                try:
+                    _ob_qs = list(OpeningBalance.objects.filter(
+                        landlord_id=landlord_obj.id,
+                        status=OpeningBalance.Status.POSTED,
+                        date__lte=as_of_date,
+                    ).select_related('target_account', 'supplier'))
+                except (ProgrammingError, OperationalError) as _:
+                    _ob_qs = []
+                _ob_entries = []
+                _ob_assets_in = Decimal('0')
+                _ob_liabilities_in = Decimal('0')
+                # Per-supplier rollup so the landlord can see "I owe
+                # Apex Finance $X total via OB". Only suppliers with
+                # at least one OB row land here.
+                _supplier_totals: dict = {}
+                for ob in _ob_qs:
+                    acct = ob.target_account
+                    is_asset_dir = (ob.direction == OpeningBalance.EntryDirection.DEBIT)
+                    impact = ob.amount if is_asset_dir else -ob.amount
+                    if acct.account_type == 'asset':
+                        _ob_assets_in += ob.amount if is_asset_dir else -ob.amount
+                    elif acct.account_type == 'liability':
+                        _ob_liabilities_in += ob.amount if not is_asset_dir else -ob.amount
+                    sup = ob.supplier
+                    if sup is not None:
+                        agg = _supplier_totals.setdefault(sup.id, {
+                            'supplier_id': sup.id,
+                            'supplier_code': sup.code,
+                            'supplier_name': sup.name,
+                            'amount_owed': Decimal('0'),
+                            'entry_count': 0,
+                        })
+                        # Liability-side (Cr) entries grow what we owe
+                        # the supplier; asset-side (Dr) entries reduce
+                        # the exposure (e.g. supplier overpayment).
+                        agg['amount_owed'] += ob.amount if not is_asset_dir else -ob.amount
+                        agg['entry_count'] += 1
+                    _ob_entries.append({
+                        'id': ob.id,
+                        'entry_number': ob.entry_number,
+                        'date': str(ob.date),
+                        'account_code': acct.code,
+                        'account_name': acct.name,
+                        'account_type': acct.account_type,
+                        'direction': ob.direction,
+                        'description': ob.custom_description or ob.description,
+                        'amount': float(ob.amount),
+                        'impact': float(impact),
+                        'supplier_id': sup.id if sup else None,
+                        'supplier_name': sup.name if sup else '',
+                        'supplier_code': sup.code if sup else '',
+                    })
+                if _ob_entries:
+                    breakdowns['opening_balances'] = {
+                        'entries': _ob_entries,
+                        'total_assets_introduced': float(_ob_assets_in),
+                        'total_liabilities_introduced': float(_ob_liabilities_in),
+                        'net_equity_impact': float(_ob_assets_in - _ob_liabilities_in),
+                        'by_supplier': [
+                            {**v, 'amount_owed': float(v['amount_owed'])}
+                            for v in _supplier_totals.values()
+                            if v['amount_owed'] != 0
+                        ],
+                        'note': (
+                            'Opening Layer entries (pre-takeover balances). These '
+                            'are reflected in the Balance Sheet totals above but '
+                            'do not move cash, so they are NOT included in the '
+                            'Funds Held in Trust composition or the cash-basis '
+                            'equity reconciliation.'
+                        ),
+                    }
+
+        total_liab_equity = total_liabilities + total_equity
+
+        return Response({
+            'report_name': 'Balance Sheet',
+            'as_of_date': str(as_of_date),
+            'assets': {
+                'accounts': asset_list,
+                'total': float(total_assets),
+                # Spec-compliant 4-sub-category structure for landlord-
+                # scoped sheets. Frontend should prefer `sub_categories`
+                # when present and render the 4 buckets unconditionally
+                # (even when totals are zero).
+                'sub_categories': sub_categories_assets,
+            },
+            'liabilities': {
+                'accounts': liability_list,
+                'total': float(total_liabilities),
+                'sub_categories': sub_categories_liabilities,
+            },
+            'equity': {
+                'accounts': equity_list,
+                'total': float(total_equity)
+            },
+            'breakdowns': breakdowns,
+            'scope': {
+                'landlord_id': int(landlord_id) if landlord_id else None,
+                'property_id': int(property_id) if property_id else None,
+                'is_scoped': scope_filter is not None,
+            },
+            'totals': {
+                'assets': float(total_assets),
+                'liabilities_equity': float(total_liab_equity),
+                'balanced': abs(total_assets - total_liab_equity) < Decimal('0.01'),
+                # 'gl_derived' on agency-wide sheets, 'balancing_residual' on
+                # landlord-scoped. `balanced=true` is meaningless under the
+                # plug method — surface the method so the frontend can show
+                # the math instead of pretending the books cleared.
+                'equity_method': equity_method,
+                'equity_components': equity_components,
+            }
+        })
+
+
+class VacancyReportView(APIView):
+    """Vacancy Report by Property."""
+    permission_classes = [IsAuthenticated]
+
+    @_cache_report('vacancy', ttl=300)
+    def get(self, request):
+        properties = Property.objects.filter(
+            management_type='rental'
+        ).select_related('landlord').annotate(
+            unit_count=Count('units'),
+            vacant_count=Count('units', filter=Q(units__is_occupied=False)),
+            occupied_count=Count('units', filter=Q(units__is_occupied=True))
+        )
+
+        report_data = []
+        total_units = 0
+        total_vacant = 0
+
+        for prop in properties:
+            vacancy_rate = (prop.vacant_count / prop.unit_count * 100) if prop.unit_count else 0
+            report_data.append({
+                'property_id': prop.id,
+                'code': prop.code,
+                'name': prop.name,
+                'landlord': prop.landlord.name,
+                'landlord_id': prop.landlord.id,
+                'total_units': prop.unit_count,
+                'occupied': prop.occupied_count,
+                'vacant': prop.vacant_count,
+                'vacancy_rate': round(vacancy_rate, 1)
+            })
+            total_units += prop.unit_count
+            total_vacant += prop.vacant_count
+
+        return Response({
+            'report_name': 'Vacancy Report',
+            'generated_at': timezone.now().isoformat(),
+            'properties': report_data,
+            'summary': {
+                'total_properties': len(report_data),
+                'total_units': total_units,
+                'total_vacant': total_vacant,
+                'overall_vacancy_rate': round((total_vacant / total_units * 100), 1) if total_units else 0
+            }
+        })
+
+
+class RentRollView(APIView):
+    """Rent Roll Report - All active leases with rental amounts."""
+    permission_classes = [IsAuthenticated]
+
+    @_cache_report('rent_roll', ttl=300)
+    def get(self, request):
+        leases = LeaseAgreement.objects.filter(
+            status='active'
+        ).select_related('tenant', 'unit', 'unit__property')
+
+        report_data = []
+        total_rent = Decimal('0')
+
+        for lease in leases:
+            report_data.append({
+                'lease_id': lease.id,
+                'lease_number': lease.lease_number,
+                'tenant_id': lease.tenant_id,
+                'tenant': lease.tenant.name,
+                'property_id': lease.unit.property_id,
+                'property': lease.unit.property.name,
+                'unit_id': lease.unit_id,
+                'unit': lease.unit.unit_number,
+                'monthly_rent': float(lease.monthly_rent),
+                'currency': lease.currency,
+                'start_date': str(lease.start_date),
+                'end_date': str(lease.end_date)
+            })
+            total_rent += lease.monthly_rent
+
+        return Response({
+            'report_name': 'Rent Roll',
+            'generated_at': timezone.now().isoformat(),
+            'leases': report_data,
+            'summary': {
+                'total_leases': len(report_data),
+                'total_monthly_rent': float(total_rent)
+            }
+        })
+
+
+class RentRolloverView(APIView):
+    """Rent Rollover Report — period-based balance movements.
+
+    Level 1 (no property_id): property summary rows.
+    Level 2 (with property_id): individual lease rows for that property.
+    """
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        start_date = request.query_params.get('start_date')
+        end_date = request.query_params.get('end_date')
+        property_id = request.query_params.get('property_id')
+
+        if not start_date or not end_date:
+            return Response({'error': 'start_date and end_date required'}, status=400)
+
+        leases = LeaseAgreement.objects.filter(status='active').select_related(
+            'tenant', 'unit', 'unit__property', 'unit__property__landlord'
+        )
+        if property_id:
+            leases = leases.filter(unit__property_id=property_id)
+
+        lease_list = list(leases)
+        lease_ids = [l.id for l in lease_list]
+
+        if not lease_ids:
+            empty_summary = {
+                'total_balance_bf': 0, 'total_charged': 0, 'total_due': 0,
+                'total_paid': 0, 'total_carried_forward': 0,
+            }
+            if property_id:
+                return Response({
+                    'level': 2, 'property_id': int(property_id),
+                    'property_name': '', 'landlord_name': '', 'currency': '',
+                    'period': {'start': start_date, 'end': end_date},
+                    'leases': [], 'summary': empty_summary,
+                })
+            return Response({
+                'level': 1,
+                'period': {'start': start_date, 'end': end_date},
+                'properties': [], 'summary': empty_summary,
+            })
+
+        # Batch queries — invoices/receipts × before/during period
+        inv_before = dict(Invoice.objects.filter(
+            lease_id__in=lease_ids, date__lt=start_date
+        ).values('lease_id').annotate(
+            t=Coalesce(Sum('total_amount'), Decimal('0'))
+        ).values_list('lease_id', 't'))
+
+        rcpt_before = dict(Receipt.objects.filter(
+            invoice__lease_id__in=lease_ids, date__lt=start_date
+        ).values('invoice__lease_id').annotate(
+            t=Coalesce(Sum('amount'), Decimal('0'))
+        ).values_list('invoice__lease_id', 't'))
+
+        inv_period = dict(Invoice.objects.filter(
+            lease_id__in=lease_ids, date__gte=start_date, date__lte=end_date
+        ).values('lease_id').annotate(
+            t=Coalesce(Sum('total_amount'), Decimal('0'))
+        ).values_list('lease_id', 't'))
+
+        rcpt_period = dict(Receipt.objects.filter(
+            invoice__lease_id__in=lease_ids, date__gte=start_date, date__lte=end_date
+        ).values('invoice__lease_id').annotate(
+            t=Coalesce(Sum('amount'), Decimal('0'))
+        ).values_list('invoice__lease_id', 't'))
+
+        # Build per-lease rows
+        lease_rows = []
+        for lease in lease_list:
+            ib = float(inv_before.get(lease.id, Decimal('0')))
+            rb = float(rcpt_before.get(lease.id, Decimal('0')))
+            ip = float(inv_period.get(lease.id, Decimal('0')))
+            rp = float(rcpt_period.get(lease.id, Decimal('0')))
+
+            balance_bf = round(ib - rb, 2)
+            amount_charged = round(ip, 2)
+            amount_due = round(balance_bf + amount_charged, 2)
+            amount_paid = round(rp, 2)
+            carried_forward = round(amount_due - amount_paid, 2)
+
+            lease_rows.append({
+                'lease_id': lease.id,
+                'lease_number': lease.lease_number,
+                'tenant_id': lease.tenant_id,
+                'tenant_name': lease.tenant.name,
+                'unit_id': lease.unit_id,
+                'unit_number': lease.unit.unit_number,
+                'property_id': lease.unit.property_id,
+                'property_name': lease.unit.property.name,
+                'landlord_id': lease.unit.property.landlord_id,
+                'landlord_name': lease.unit.property.landlord.name if lease.unit.property.landlord else '',
+                'currency': lease.currency,
+                'balance_bf': balance_bf,
+                'amount_charged': amount_charged,
+                'amount_due': amount_due,
+                'amount_paid': amount_paid,
+                'carried_forward': carried_forward,
+            })
+
+        def _summary(rows):
+            return {
+                'total_balance_bf': round(sum(r['balance_bf'] for r in rows), 2),
+                'total_charged': round(sum(r['amount_charged'] for r in rows), 2),
+                'total_due': round(sum(r['amount_due'] for r in rows), 2),
+                'total_paid': round(sum(r['amount_paid'] for r in rows), 2),
+                'total_carried_forward': round(sum(r['carried_forward'] for r in rows), 2),
+            }
+
+        if property_id:
+            # Level 2 — individual lease rows
+            first = lease_rows[0] if lease_rows else {}
+            return Response({
+                'level': 2,
+                'property_id': int(property_id),
+                'property_name': first.get('property_name', ''),
+                'landlord_name': first.get('landlord_name', ''),
+                'currency': first.get('currency', ''),
+                'period': {'start': start_date, 'end': end_date},
+                'leases': lease_rows,
+                'summary': _summary(lease_rows),
+            })
+
+        # Level 1 — group by property
+        from collections import defaultdict
+        by_prop = defaultdict(list)
+        for row in lease_rows:
+            by_prop[row['property_id']].append(row)
+
+        properties = []
+        for pid, rows in by_prop.items():
+            first = rows[0]
+            s = _summary(rows)
+            properties.append({
+                'property_id': pid,
+                'property_name': first['property_name'],
+                'landlord_id': first['landlord_id'],
+                'landlord_name': first['landlord_name'],
+                'currency': first['currency'],
+                'lease_count': len(rows),
+                'balance_bf': s['total_balance_bf'],
+                'amount_charged': s['total_charged'],
+                'amount_due': s['total_due'],
+                'amount_paid': s['total_paid'],
+                'carried_forward': s['total_carried_forward'],
+            })
+
+        properties.sort(key=lambda p: p['property_name'])
+
+        return Response({
+            'level': 1,
+            'period': {'start': start_date, 'end': end_date},
+            'properties': properties,
+            'summary': _summary(lease_rows),
+        })
+
+
+class LandlordStatementView(APIView):
+    """Landlord Account Summary - receipts, commissions and expenses.
+    Supports both unit-based (rental) and property-based (levy) invoices,
+    and optional currency filtering."""
+    permission_classes = [IsAuthenticated]
+
+    def _compute_commission(self, receipt, landlord):
+        """Compute commission for a single receipt."""
+        # Resolve per-(property, income_type) override, fall back to
+        # IncomeType default, otherwise 0%. landlord arg kept for the
+        # signature stability — not consulted any more.
+        prop_id = None
+        if receipt.invoice_id and receipt.invoice:
+            if receipt.invoice.unit_id and receipt.invoice.unit and receipt.invoice.unit.property_id:
+                prop_id = receipt.invoice.unit.property_id
+            elif receipt.invoice.property_id:
+                prop_id = receipt.invoice.property_id
+        rate = _resolve_commission_rate_pct(receipt.income_type, prop_id) / 100
+        return receipt.amount * rate
+
+    @staticmethod
+    def _receipt_base_qs(unit_id_list, property_id_list, currency=None):
+        """Apply the shared scope helper. Uses `_scoped_receipt_qs` so the
+        OR'd JOINs from `_receipt_scope_q` don't break later
+        `.aggregate(_commission_expr())` calls (the OuterRef subquery in
+        _commission_expr can't bind through a DISTINCT wrapper)."""
+        qs = _scoped_receipt_qs(unit_id_list, property_id_list)
+        if currency:
+            qs = qs.filter(currency=currency)
+        return qs
+
+    def get(self, request):
+        landlord_id = request.query_params.get('landlord_id')
+        start_date = request.query_params.get('start_date')
+        end_date = request.query_params.get('end_date')
+        currency = request.query_params.get('currency', '').upper() or None
+
+        if not landlord_id:
+            return Response({'error': 'landlord_id is required'}, status=400)
+
+        try:
+            landlord = Landlord.objects.get(id=landlord_id)
+        except Landlord.DoesNotExist:
+            return Response({'error': 'Landlord not found'}, status=404)
+
+        # Default date range: current month
+        today = timezone.now().date()
+        if not end_date:
+            end_date = today
+        else:
+            end_date = date.fromisoformat(str(end_date))
+        if not start_date:
+            start_date = end_date.replace(day=1)
+        else:
+            start_date = date.fromisoformat(str(start_date))
+
+        # Get properties and units
+        properties = landlord.properties.all()
+        property_id_list = list(properties.values_list('id', flat=True))
+        units = Unit.objects.filter(property__in=properties)
+        unit_id_list = list(units.values_list('id', flat=True))
+
+        # Commission SQL expression — resolves per (property, income_type)
+        # via PropertyIncomeCommission, falling back to IncomeType default.
+        commission_expr = _commission_expr()
+
+        # ── Opening balance (all transactions before start_date) ──
+        # Use DB aggregation instead of Python loops to avoid OOM for large histories
+        prior_receipt_qs = self._receipt_base_qs(unit_id_list, property_id_list, currency).filter(
+            date__lt=start_date,
+        )
+        prior_agg = prior_receipt_qs.aggregate(
+            receipts_total=Sum('amount'),
+            commissions_total=Sum(commission_expr),
+        )
+        prior_receipts_total = prior_agg['receipts_total'] or Decimal('0')
+        prior_commissions_total = prior_agg['commissions_total'] or Decimal('0')
+
+        # The Landlord Account is a cash-basis trust statement — non-cash
+        # expenses (accruals/depreciation) never moved funds out of the
+        # landlord's trust pocket, so they don't belong on this ledger.
+        # Accruals show on the P&L (Income Statement) instead.
+        prior_expense_qs = Expense.objects.filter(
+            payee_type='landlord', payee_id=landlord.id,
+            status='paid', date__lt=start_date,
+        ).exclude(expense_kind='non_cash')
+        if currency:
+            prior_expense_qs = prior_expense_qs.filter(currency=currency)
+        prior_expenses_total = prior_expense_qs.aggregate(t=Sum('amount'))['t'] or Decimal('0')
+
+        opening_balance = prior_receipts_total - prior_commissions_total - prior_expenses_total
+
+        # ── Period transactions ──
+        receipts = self._receipt_base_qs(unit_id_list, property_id_list, currency).filter(
+            date__gte=start_date, date__lte=end_date,
+        ).select_related(
+            'tenant', 'invoice', 'invoice__unit', 'invoice__unit__property',
+            'invoice__lease', 'income_type',
+        ).order_by('date')
+
+        expense_qs = Expense.objects.filter(
+            payee_type='landlord', payee_id=landlord.id,
+            status='paid',
+            date__gte=start_date, date__lte=end_date,
+        ).exclude(expense_kind='non_cash')
+        if currency:
+            expense_qs = expense_qs.filter(currency=currency)
+        expenses = expense_qs.order_by('date')
+
+        transactions = []
+        total_receipts = Decimal('0')
+        total_commissions = Decimal('0')
+        total_expenses = Decimal('0')
+        txn_id = 0
+
+        for rcpt in receipts:
+            lease_id = rcpt.invoice.lease_id if rcpt.invoice else ''
+            tenant_name = rcpt.tenant.name if rcpt.tenant else ''
+            unit_str = str(rcpt.invoice.unit) if rcpt.invoice and rcpt.invoice.unit else ''
+            ref = rcpt.reference or rcpt.receipt_number
+
+            # Credit: receipt
+            txn_id += 1
+            transactions.append({
+                'id': txn_id,
+                'date': str(rcpt.date),
+                'type': 'receipt',
+                'description': f"Payment Leaseid-{lease_id} -{tenant_name} {unit_str} Ref-{ref}",
+                'debit': 0,
+                'credit': float(rcpt.amount),
+            })
+            total_receipts += rcpt.amount
+
+            # Debit: commission for this receipt
+            commission_amt = self._compute_commission(rcpt, landlord)
+            if commission_amt > 0:
+                income_type_name = rcpt.income_type.name if rcpt.income_type else 'Levy'
+                txn_id += 1
+                transactions.append({
+                    'id': txn_id,
+                    'date': str(rcpt.date),
+                    'type': 'commission',
+                    'description': f"{income_type_name} Commission Leaseid-{lease_id} Ref-{ref}",
+                    'debit': float(commission_amt),
+                    'credit': 0,
+                })
+                total_commissions += commission_amt
+
+        for exp in expenses:
+            txn_id += 1
+            ref_part = f" ref-{exp.reference}" if exp.reference else ''
+            transactions.append({
+                'id': txn_id,
+                'date': str(exp.date),
+                'type': 'expense',
+                'description': f"Journal{ref_part}-{exp.description}",
+                'debit': float(exp.amount),
+                'credit': 0,
+            })
+            total_expenses += exp.amount
+
+        # Sort all transactions by date, keeping receipt before its commission
+        transactions.sort(key=lambda x: (x['date'], x['id']))
+
+        # Running balance: opening + credits - debits
+        running_balance = opening_balance
+        for txn in transactions:
+            running_balance += Decimal(str(txn['credit'])) - Decimal(str(txn['debit']))
+            txn['balance'] = float(running_balance)
+
+        total_debits = total_commissions + total_expenses
+        total_credits = total_receipts
+
+        # Total invoiced for the period — covers what was billed to the
+        # landlord's tenants regardless of whether anything was collected.
+        # Drives the "Total Invoiced" KPI on LandlordDetail.
+        invoice_qs = Invoice.objects.filter(
+            Q(unit__property__landlord_id=landlord.id) |
+            Q(property__landlord_id=landlord.id),
+            date__gte=start_date,
+            date__lte=end_date,
+        )
+        if currency:
+            invoice_qs = invoice_qs.filter(currency=currency)
+        total_invoiced = invoice_qs.aggregate(t=Sum('amount'))['t'] or Decimal('0')
+        # Net payable = receipts - commissions - expenses (i.e. what the
+        # agency still owes the landlord at the end of the period).
+        net_payable = total_receipts - total_commissions - total_expenses
+
+        return Response({
+            'report_name': 'Landlord Account Summary',
+            'landlord': {
+                'id': landlord.id,
+                'code': landlord.code,
+                'name': landlord.name,
+            },
+            'period': {
+                'start': str(start_date),
+                'end': str(end_date),
+            },
+            'currency': currency or 'USD',
+            # Top-level convenience fields for the LandlordDetail KPI cards.
+            # Mirror the values inside `summary` so legacy frontends that
+            # read either shape keep working.
+            'total_invoiced': float(total_invoiced),
+            'total_collected': float(total_receipts),
+            'net_payable': float(net_payable),
+            'summary': {
+                'opening_balance': float(opening_balance),
+                'total_invoiced': float(total_invoiced),
+                'total_receipts': float(total_receipts),
+                'total_collected': float(total_receipts),
+                'total_commissions': float(total_commissions),
+                'total_expenses': float(total_expenses),
+                'total_debits': float(total_debits),
+                'total_credits': float(total_credits),
+                'net_payable': float(net_payable),
+                'closing_balance': float(running_balance),
+                # Legacy single-rate metadata. Now that commissions resolve
+                # per (property, income_type), there's no single rate to
+                # surface here — set to 0 so existing clients don't crash
+                # but no longer trust this field.
+                'commission_rate': 0,
+            },
+            'properties': [
+                {
+                    'name': p.name,
+                    'units': p.unit_count,
+                }
+                for p in properties.annotate(unit_count=Count('units'))
+            ],
+            'transactions': transactions,
+            'transaction_count': len(transactions),
+        })
+
+
+class CashFlowStatementView(APIView):
+    """Cash Flow Statement Report."""
+    permission_classes = [IsAuthenticated]
+
+    @_cache_report('cash_flow', ttl=300)
+    def get(self, request):
+        start_date = request.query_params.get('start_date')
+        end_date = request.query_params.get('end_date', timezone.now().date())
+        landlord_id = request.query_params.get('landlord_id')
+        property_id = request.query_params.get('property_id')
+
+        # Build date filter
+        date_filter = Q(date__lte=end_date)
+        if start_date:
+            date_filter &= Q(date__gte=start_date)
+
+        # Landlord/property scoping. None when both are blank — the report
+        # then runs agency-wide.
+        scope_filter = _gl_filter_for_landlord(landlord_id, property_id)
+        # Cash Flow is, by definition, only cash transactions — strip every
+        # GL entry that came from a non-cash Expense (accruals/depreciation)
+        # so outflows reflect actual movements out of the bank. Receipts and
+        # invoice GL rows are unaffected.
+        non_cash_exclusion = _exclude_non_cash_expenses_q()
+
+        # Operating Activities - Cash Inflows
+        # Receipts from tenants. Scoping uses tenant via lease/unit OR
+        # invoice's denormalized property — same lineage as the GL helper.
+        receipt_qs = Receipt.objects.filter(date_filter)
+        if landlord_id or property_id:
+            tenant_filter = Q()
+            if landlord_id:
+                tenant_filter &= (
+                    Q(unit__property__landlord_id=landlord_id) |
+                    Q(leases__property__landlord_id=landlord_id) |
+                    Q(leases__unit__property__landlord_id=landlord_id)
+                )
+            if property_id:
+                tenant_filter &= (
+                    Q(unit__property_id=property_id) |
+                    Q(leases__property_id=property_id) |
+                    Q(leases__unit__property_id=property_id)
+                )
+            tenant_ids_cf = list(
+                RentalTenant.objects.filter(tenant_filter).values_list('id', flat=True).distinct()
+            )
+            if landlord_id:
+                receipt_qs = receipt_qs.filter(
+                    Q(tenant_id__in=tenant_ids_cf) |
+                    Q(invoice__property__landlord_id=landlord_id) |
+                    Q(invoice__unit__property__landlord_id=landlord_id)
+                )
+            if property_id:
+                receipt_qs = receipt_qs.filter(
+                    Q(tenant_id__in=tenant_ids_cf) |
+                    Q(invoice__property_id=property_id) |
+                    Q(invoice__unit__property_id=property_id)
+                )
+        tenant_receipts = receipt_qs.aggregate(total=Sum('amount'))['total'] or Decimal('0')
+
+        # Operating Activities - Cash Outflows. Split into three buckets so
+        # users can see at a glance where the cash went:
+        #   1. expense_payments  — operating costs paid from the trust
+        #      (utilities, maintenance, vendor invoices, etc.)
+        #   2. agent_commission  — what the managing agent kept as fees.
+        #      Always computed from receipts × commission_rate; the agency
+        #      GL doesn't post commission as a discrete cash movement we
+        #      can sum directly.
+        #   3. landlord_payments — actual remittances paid TO the landlord
+        #      (Expense.expense_type='landlord_payment'). This is the line
+        #      that was being mislabelled before — the previous code had
+        #      commission filed under "Cash paid to landlords".
+        expense_accounts = ChartOfAccount.objects.filter(
+            account_type='expense', is_active=True
+        )
+
+        # Identify cash expenses tagged as remittances to the landlord. We
+        # excise these from `expense_payments` so the trust-paid operating
+        # costs don't double-count with the landlord remittance line.
+        landlord_payment_expense_qs = Expense.objects.filter(
+            date_filter,
+            expense_type='landlord_payment',
+            status='paid',
+        ).exclude(expense_kind='non_cash')
+        if landlord_id:
+            landlord_payment_expense_qs = landlord_payment_expense_qs.filter(
+                Q(landlord_id=landlord_id) | Q(payee_type='landlord', payee_id=landlord_id)
+            )
+        landlord_payments = landlord_payment_expense_qs.aggregate(t=Sum('amount'))['t'] or Decimal('0')
+        landlord_payment_ids = list(landlord_payment_expense_qs.values_list('id', flat=True))
+
+        gl_expenses = GeneralLedger.objects.filter(
+            date_filter,
+            account__in=expense_accounts,
+        )
+        if scope_filter is not None:
+            gl_expenses = gl_expenses.filter(scope_filter)
+        if non_cash_exclusion is not None:
+            gl_expenses = gl_expenses.exclude(non_cash_exclusion)
+        if landlord_payment_ids:
+            # Don't double-count remittances — they have their own line.
+            gl_expenses = gl_expenses.exclude(
+                journal_entry__source_type='expense',
+                journal_entry__source_id__in=landlord_payment_ids,
+            )
+        expense_payments = gl_expenses.aggregate(total=Sum('debit_amount'))['total'] or Decimal('0')
+
+        # Agent commission — only meaningful under landlord scope (the
+        # agency-wide view doesn't decompose per landlord, and the agent
+        # IS the agency anyway). Zero out otherwise.
+        agent_commission = Decimal('0')
+        agent_commission_by_type: list = []
+        if scope_filter is not None and landlord_id:
+            try:
+                landlord_obj = Landlord.objects.get(id=landlord_id)
+            except Landlord.DoesNotExist:
+                landlord_obj = None
+            if landlord_obj:
+                # Group commission per income type so the Cash Flow line
+                # "Cash paid to managing agent" can split into per-sub-account
+                # rows: rent commission, maintenance commission, parking
+                # commission, etc. Different income types can carry
+                # different rates per (property, income_type).
+                by_type = list(
+                    receipt_qs.values(
+                        'income_type__id', 'income_type__name', 'income_type__code',
+                    ).annotate(commission=Sum(_commission_expr()))
+                    .order_by('income_type__name')
+                )
+                for row in by_type:
+                    amt = row['commission'] or Decimal('0')
+                    if amt == 0:
+                        continue
+                    agent_commission += amt
+                    agent_commission_by_type.append({
+                        'income_type_id': row['income_type__id'],
+                        'income_type_name': row['income_type__name'] or 'Other',
+                        'income_type_code': row['income_type__code'] or '',
+                        'amount': float(amt),
+                    })
+
+        # Calculate Operating Cash Flow
+        operating_inflows = tenant_receipts
+        operating_outflows = expense_payments + agent_commission + landlord_payments
+        net_operating = operating_inflows - operating_outflows
+
+        # Investing Activities
+        # Property/Asset purchases (debit to asset accounts)
+        asset_accounts = ChartOfAccount.objects.filter(
+            account_type='asset',
+            is_active=True,
+            code__startswith='15'  # Fixed assets typically 15xx
+        )
+
+        # Investing & financing activities — when scoped to a landlord we
+        # zero them out (asset purchases & equity contributions don't
+        # decompose per landlord at the agency level).
+        if scope_filter is not None:
+            asset_purchases = {'purchases': Decimal('0'), 'sales': Decimal('0')}
+            equity_transactions = {'contributions': Decimal('0'), 'withdrawals': Decimal('0')}
+        else:
+            asset_purchases = GeneralLedger.objects.filter(
+                date_filter,
+                account__in=asset_accounts
+            ).aggregate(
+                purchases=Sum('debit_amount'),
+                sales=Sum('credit_amount')
+            )
+            equity_accounts = ChartOfAccount.objects.filter(
+                account_type='equity', is_active=True
+            )
+            equity_transactions = GeneralLedger.objects.filter(
+                date_filter,
+                account__in=equity_accounts
+            ).aggregate(
+                contributions=Sum('credit_amount'),
+                withdrawals=Sum('debit_amount')
+            )
+
+        investing_outflows = asset_purchases['purchases'] or Decimal('0')
+        investing_inflows = asset_purchases['sales'] or Decimal('0')
+        net_investing = investing_inflows - investing_outflows
+
+
+        financing_inflows = equity_transactions['contributions'] or Decimal('0')
+        financing_outflows = equity_transactions['withdrawals'] or Decimal('0')
+        net_financing = financing_inflows - financing_outflows
+
+        # Net Change in Cash
+        net_change = net_operating + net_investing + net_financing
+
+        # Beginning / ending cash. Under scope these reflect the landlord's
+        # funds held in trust at each boundary (receipts collected to date
+        # minus commissions and cash expenses paid out). Unscoped, they
+        # roll up all cash account balances at the agency level.
+        if scope_filter is not None and landlord_id:
+            try:
+                _ll = Landlord.objects.get(id=landlord_id)
+            except Landlord.DoesNotExist:
+                _ll = None
+            if _ll:
+                # ending_cash = funds held in trust as of end_date
+                end_receipts = receipt_qs.aggregate(t=Sum('amount'))['t'] or Decimal('0')
+                end_commission = receipt_qs.aggregate(t=Sum(_commission_expr()))['t'] or Decimal('0')
+                _gl_exp_to_end = GeneralLedger.objects.filter(
+                    Q(date__lte=end_date),
+                    account__in=expense_accounts,
+                    journal_entry__source_type='expense',
+                ).filter(scope_filter)
+                if non_cash_exclusion is not None:
+                    _gl_exp_to_end = _gl_exp_to_end.exclude(non_cash_exclusion)
+                end_cash_exp = _gl_exp_to_end.aggregate(t=Sum('debit_amount'))['t'] or Decimal('0')
+                ending_cash = end_receipts - end_commission - end_cash_exp
+                beginning_cash = ending_cash - net_change
+            else:
+                ending_cash = Decimal('0')
+                beginning_cash = Decimal('0') - net_change
+        else:
+            # Agency-wide opening / closing cash — aggregate the GL deltas
+            # against bank accounts up to each date boundary instead of
+            # reading current_balance (which is lifetime and would ignore
+            # end_date for the closing figure).
+            cash_accounts = ChartOfAccount.objects.filter(
+                Q(account_subtype='bank') | Q(code__startswith='1000'),
+                is_active=True,
+            )
+            end_bal = GeneralLedger.objects.filter(
+                account__in=cash_accounts,
+                date__lte=end_date,
+            ).aggregate(
+                d=Coalesce(Sum('debit_amount'), Value(Decimal('0'))),
+                c=Coalesce(Sum('credit_amount'), Value(Decimal('0'))),
+            )
+            ending_cash = (end_bal['d'] or Decimal('0')) - (end_bal['c'] or Decimal('0'))
+            if start_date:
+                # Beginning cash = bank-account net up to (start_date − 1).
+                # Computing this directly avoids drift if anything inside
+                # the period was posted with a different signature.
+                begin_bal = GeneralLedger.objects.filter(
+                    account__in=cash_accounts,
+                    date__lt=start_date,
+                ).aggregate(
+                    d=Coalesce(Sum('debit_amount'), Value(Decimal('0'))),
+                    c=Coalesce(Sum('credit_amount'), Value(Decimal('0'))),
+                )
+                beginning_cash = (begin_bal['d'] or Decimal('0')) - (begin_bal['c'] or Decimal('0'))
+            else:
+                beginning_cash = ending_cash - net_change
+
+        return Response({
+            'report_name': 'Cash Flow Statement',
+            'period': {
+                'start': start_date,
+                'end': str(end_date)
+            },
+            'operating_activities': {
+                'inflows': {
+                    'tenant_receipts': float(tenant_receipts),
+                    'total': float(operating_inflows)
+                },
+                'outflows': {
+                    'expense_payments': float(expense_payments),
+                    'agent_commission': float(agent_commission),
+                    # Per-income-type breakdown of the agent commission
+                    # so the cash-flow line can split into rent / parking
+                    # / maintenance commissions etc. — same SQL groupby
+                    # used by Income Statement and Income & Expenditure.
+                    'agent_commission_by_type': agent_commission_by_type,
+                    # Cash actually paid to the landlord (Expense.expense_type
+                    # = 'landlord_payment'). Will be 0 until you record a
+                    # remittance — distinct from agent commission, which
+                    # used to be lumped in here.
+                    'landlord_payments': float(landlord_payments),
+                    # Legacy alias for clients that read `commission_paid`.
+                    'commission_paid': float(agent_commission),
+                    'total': float(operating_outflows)
+                },
+                'net_cash': float(net_operating)
+            },
+            'investing_activities': {
+                'inflows': {
+                    'asset_sales': float(investing_inflows),
+                    'total': float(investing_inflows)
+                },
+                'outflows': {
+                    'asset_purchases': float(investing_outflows),
+                    'total': float(investing_outflows)
+                },
+                'net_cash': float(net_investing)
+            },
+            'financing_activities': {
+                'inflows': {
+                    'owner_contributions': float(financing_inflows),
+                    'total': float(financing_inflows)
+                },
+                'outflows': {
+                    'owner_withdrawals': float(financing_outflows),
+                    'total': float(financing_outflows)
+                },
+                'net_cash': float(net_financing)
+            },
+            'summary': {
+                'net_change_in_cash': float(net_change),
+                'beginning_cash': float(beginning_cash),
+                'ending_cash': float(ending_cash)
+            },
+            'scope': {
+                'landlord_id': int(landlord_id) if landlord_id else None,
+                'property_id': int(property_id) if property_id else None,
+                'is_scoped': scope_filter is not None,
+            },
+        })
+
+
+class AgedAnalysisView(APIView):
+    """
+    Aged Analysis Report - 30-day increments.
+    Buckets: Current (0-30), 31-60, 61-90, 91-120, 120+ days
+    """
+    permission_classes = [IsAuthenticated]
+
+    @_cache_report('aged_analysis', ttl=300)
+    def get(self, request):
+        today = timezone.now().date()
+        as_of_date = request.query_params.get('as_of_date', today)
+        if isinstance(as_of_date, str):
+            as_of_date = date.fromisoformat(as_of_date)
+
+        tenant_id = request.query_params.get('tenant_id')
+        property_id = request.query_params.get('property_id')
+        landlord_id = request.query_params.get('landlord_id')
+
+        # Base queryset - unpaid invoices.
+        # `draft` is included because invoices issued via flows that don't
+        # auto-transition to 'sent' (manual create, batch generators) sit in
+        # draft with a non-zero balance and ARE genuine receivables — owing
+        # the same money to the landlord whether the agency has formally
+        # mailed the invoice yet or not.
+        invoices = Invoice.objects.filter(
+            status__in=['draft', 'sent', 'partial', 'overdue'],
+            balance__gt=0
+        ).select_related(
+            'tenant', 'unit', 'unit__property', 'unit__property__landlord',
+            'lease', 'lease__unit__property', 'lease__property', 'property',
+        )
+
+        # Apply filters. Property/landlord scoping ORs every linkage path —
+        # an invoice may carry the property via `unit`, via direct `property`
+        # FK (levy invoices), or via the `lease` chain. Narrowing only on
+        # `unit__property_id` silently drops every invoice that lacks a unit.
+        if tenant_id:
+            invoices = invoices.filter(tenant_id=tenant_id)
+        if property_id:
+            invoices = invoices.filter(_aged_analysis_property_q(property_id))
+        if landlord_id:
+            invoices = invoices.filter(_aged_analysis_landlord_q(landlord_id)).distinct()
+
+        # Calculate aging buckets
+        buckets = {
+            'current': {'label': '0-30 days', 'min': 0, 'max': 30, 'amount': Decimal('0'), 'count': 0, 'invoices': []},
+            '31_60': {'label': '31-60 days', 'min': 31, 'max': 60, 'amount': Decimal('0'), 'count': 0, 'invoices': []},
+            '61_90': {'label': '61-90 days', 'min': 61, 'max': 90, 'amount': Decimal('0'), 'count': 0, 'invoices': []},
+            '91_120': {'label': '91-120 days', 'min': 91, 'max': 120, 'amount': Decimal('0'), 'count': 0, 'invoices': []},
+            'over_120': {'label': '120+ days', 'min': 121, 'max': 9999, 'amount': Decimal('0'), 'count': 0, 'invoices': []},
+        }
+
+        tenant_summary = {}
+        total_outstanding = Decimal('0')
+
+        for invoice in invoices:
+            days_overdue = (as_of_date - invoice.due_date).days
+            if days_overdue < 0:
+                days_overdue = 0
+
+            # Determine bucket
+            if days_overdue <= 30:
+                bucket_key = 'current'
+            elif days_overdue <= 60:
+                bucket_key = '31_60'
+            elif days_overdue <= 90:
+                bucket_key = '61_90'
+            elif days_overdue <= 120:
+                bucket_key = '91_120'
+            else:
+                bucket_key = 'over_120'
+
+            balance = invoice.balance
+            buckets[bucket_key]['amount'] += balance
+            buckets[bucket_key]['count'] += 1
+            buckets[bucket_key]['invoices'].append({
+                'invoice_number': invoice.invoice_number,
+                'tenant': invoice.tenant.name,
+                'due_date': str(invoice.due_date),
+                'days_overdue': days_overdue,
+                'balance': float(balance)
+            })
+
+            total_outstanding += balance
+
+            # Build tenant summary
+            tenant_key = invoice.tenant_id
+            if tenant_key not in tenant_summary:
+                tenant_summary[tenant_key] = {
+                    'tenant_id': invoice.tenant.id,
+                    'tenant_code': invoice.tenant.code,
+                    'tenant_name': invoice.tenant.name,
+                    'current': Decimal('0'),
+                    '31_60': Decimal('0'),
+                    '61_90': Decimal('0'),
+                    '91_120': Decimal('0'),
+                    'over_120': Decimal('0'),
+                    'total': Decimal('0')
+                }
+            tenant_summary[tenant_key][bucket_key] += balance
+            tenant_summary[tenant_key]['total'] += balance
+
+        # Convert tenant summary to list and serialize
+        tenant_list = []
+        for ts in tenant_summary.values():
+            tenant_list.append({
+                'tenant_id': ts['tenant_id'],
+                'tenant_code': ts['tenant_code'],
+                'tenant_name': ts['tenant_name'],
+                'current': float(ts['current']),
+                '31_60': float(ts['31_60']),
+                '61_90': float(ts['61_90']),
+                '91_120': float(ts['91_120']),
+                'over_120': float(ts['over_120']),
+                'total': float(ts['total'])
+            })
+
+        # Sort by total descending
+        tenant_list.sort(key=lambda x: x['total'], reverse=True)
+
+        # Prepare bucket summary (without invoice details for summary view)
+        bucket_summary = {
+            key: {
+                'label': bucket['label'],
+                'amount': float(bucket['amount']),
+                'count': bucket['count'],
+                'percentage': round(float(bucket['amount']) / float(total_outstanding) * 100, 1) if total_outstanding else 0
+            }
+            for key, bucket in buckets.items()
+        }
+
+        return Response({
+            'report_name': 'Aged Analysis',
+            'as_of_date': str(as_of_date),
+            'filters': {
+                'tenant_id': tenant_id,
+                'property_id': property_id,
+                'landlord_id': landlord_id
+            },
+            'summary': {
+                'total_outstanding': float(total_outstanding),
+                'total_invoices': sum(b['count'] for b in buckets.values()),
+                'buckets': bucket_summary
+            },
+            'by_tenant': tenant_list,
+            # Chart data for visualization
+            'chart_data': {
+                'labels': [b['label'] for b in bucket_summary.values()],
+                'amounts': [b['amount'] for b in bucket_summary.values()],
+                'counts': [b['count'] for b in bucket_summary.values()]
+            }
+        })
+
+
+class TenantAccountSummaryView(APIView):
+    """
+    Tenant Account Summary - Full account history for a tenant.
+    Shows invoices, receipts, and running balance.
+    """
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        tenant_id = request.query_params.get('tenant_id')
+        start_date = request.query_params.get('start_date')
+        end_date = request.query_params.get('end_date', timezone.now().date())
+
+        if not tenant_id:
+            return Response({'error': 'tenant_id is required'}, status=400)
+
+        try:
+            tenant = RentalTenant.objects.get(id=tenant_id)
+        except RentalTenant.DoesNotExist:
+            return Response({'error': 'Tenant not found'}, status=404)
+
+        # Get invoices
+        invoices = Invoice.objects.filter(tenant=tenant)
+        if start_date:
+            invoices = invoices.filter(date__gte=start_date)
+        invoices = invoices.filter(date__lte=end_date).order_by('date')
+
+        # Get receipts
+        receipts = Receipt.objects.filter(tenant=tenant)
+        if start_date:
+            receipts = receipts.filter(date__gte=start_date)
+        receipts = receipts.filter(date__lte=end_date).order_by('date')
+
+        # Build transaction list
+        transactions = []
+
+        for inv in invoices:
+            transactions.append({
+                'date': str(inv.date),
+                'type': 'invoice',
+                'reference': inv.invoice_number,
+                'description': inv.description or f'{inv.get_invoice_type_display()} - {inv.period_start} to {inv.period_end}',
+                'debit': float(inv.total_amount),
+                'credit': 0,
+                'invoice_type': inv.invoice_type
+            })
+
+        for rcpt in receipts:
+            transactions.append({
+                'date': str(rcpt.date),
+                'type': 'receipt',
+                'reference': rcpt.receipt_number,
+                'description': rcpt.description or f'Payment - {rcpt.get_payment_method_display()}',
+                'debit': 0,
+                'credit': float(rcpt.amount),
+                'payment_method': rcpt.payment_method
+            })
+
+        # Sort by date
+        transactions.sort(key=lambda x: x['date'])
+
+        # Calculate running balance
+        running_balance = Decimal('0')
+        for txn in transactions:
+            running_balance += Decimal(str(txn['debit'])) - Decimal(str(txn['credit']))
+            txn['balance'] = float(running_balance)
+
+        # Summary
+        total_invoiced = invoices.aggregate(Sum('total_amount'))['total_amount__sum'] or 0
+        total_paid = receipts.aggregate(Sum('amount'))['amount__sum'] or 0
+
+        # Active lease info
+        active_lease = LeaseAgreement.objects.filter(
+            tenant=tenant, status='active'
+        ).select_related('unit', 'unit__property').first()
+
+        return Response({
+            'report_name': 'Tenant Account Summary',
+            'tenant': {
+                'id': tenant.id,
+                'code': tenant.code,
+                'name': tenant.name,
+                'email': tenant.email,
+                'phone': tenant.phone,
+                'account_type': tenant.account_type
+            },
+            'active_lease': {
+                'lease_number': active_lease.lease_number,
+                'unit': str(active_lease.unit),
+                'property': active_lease.unit.property.name,
+                'monthly_rent': float(active_lease.monthly_rent),
+                'start_date': str(active_lease.start_date),
+                'end_date': str(active_lease.end_date)
+            } if active_lease else None,
+            'period': {
+                'start': start_date,
+                'end': str(end_date)
+            },
+            'summary': {
+                'total_invoiced': float(total_invoiced),
+                'total_paid': float(total_paid),
+                'current_balance': float(total_invoiced - total_paid),
+                'transaction_count': len(transactions)
+            },
+            'transactions': transactions
+        })
+
+
+class DepositAccountSummaryView(APIView):
+    """
+    Deposit Account Summary - Tenant deposit tracking.
+    Shows deposits held, refunds, and current deposit balance.
+    """
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        tenant_id = request.query_params.get('tenant_id')
+        property_id = request.query_params.get('property_id')
+
+        # Build queryset for active leases with deposits
+        leases = LeaseAgreement.objects.filter(
+            deposit_amount__gt=0
+        ).select_related('tenant', 'unit', 'unit__property')
+
+        if tenant_id:
+            leases = leases.filter(tenant_id=tenant_id)
+        if property_id:
+            leases = leases.filter(unit__property_id=property_id)
+
+        # Get deposit invoices
+        deposit_invoices = Invoice.objects.filter(
+            invoice_type='deposit'
+        ).select_related('tenant', 'unit')
+
+        if tenant_id:
+            deposit_invoices = deposit_invoices.filter(tenant_id=tenant_id)
+        if property_id:
+            deposit_invoices = deposit_invoices.filter(unit__property_id=property_id)
+
+        # Pre-fetch deposit invoices into a dict keyed by (tenant_id, lease_id)
+        # to avoid N+1 queries (one DB hit per lease).
+        deposit_inv_map = {}
+        for inv in deposit_invoices:
+            key = (inv.tenant_id, inv.lease_id)
+            if key not in deposit_inv_map:
+                deposit_inv_map[key] = inv
+
+        # Build deposit summary
+        deposits = []
+        total_deposits_required = Decimal('0')
+        total_deposits_paid = Decimal('0')
+        total_deposits_held = Decimal('0')
+
+        for lease in leases:
+            deposit_inv = deposit_inv_map.get((lease.tenant_id, lease.id))
+            deposit_paid = deposit_inv.amount_paid if deposit_inv else Decimal('0')
+            deposit_required = lease.deposit_amount
+
+            deposits.append({
+                'lease_id': lease.id,
+                'lease_number': lease.lease_number,
+                'tenant_id': lease.tenant.id,
+                'tenant_name': lease.tenant.name,
+                'property_id': lease.unit.property_id,
+                'property': lease.unit.property.name,
+                'unit_id': lease.unit_id,
+                'unit': lease.unit.unit_number,
+                'deposit_required': float(deposit_required),
+                'deposit_paid': float(deposit_paid),
+                'deposit_outstanding': float(deposit_required - deposit_paid),
+                'lease_status': lease.status,
+                'is_fully_paid': deposit_paid >= deposit_required
+            })
+
+            total_deposits_required += deposit_required
+            total_deposits_paid += deposit_paid
+            if lease.status == 'active':
+                total_deposits_held += deposit_paid
+
+        return Response({
+            'report_name': 'Deposit Account Summary',
+            'generated_at': timezone.now().isoformat(),
+            'filters': {
+                'tenant_id': tenant_id,
+                'property_id': property_id
+            },
+            'summary': {
+                'total_deposits_required': float(total_deposits_required),
+                'total_deposits_paid': float(total_deposits_paid),
+                'total_deposits_outstanding': float(total_deposits_required - total_deposits_paid),
+                'total_deposits_held': float(total_deposits_held),
+                'deposit_count': len(deposits)
+            },
+            'deposits': deposits
+        })
+
+
+class CommissionReportView(APIView):
+    """
+    Commission Report - Commission earned from managed properties.
+    Breaks down commission by landlord, property, and income type.
+    """
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        start_date = request.query_params.get('start_date')
+        end_date = request.query_params.get('end_date', timezone.now().date())
+        landlord_id = request.query_params.get('landlord_id')
+
+        # Invoice-linked receipts aggregate fast at the DB level; receipts
+        # WITHOUT an invoice (direct payments) are resolved per-receipt via
+        # the paying tenant and merged in below — otherwise they vanish
+        # from this report entirely.
+        comm_expr = _commission_expr()
+        invoice_type_choices = dict(Invoice._meta.get_field('invoice_type').flatchoices)
+
+        landlords: dict = {}    # id  -> {…, collected, commission}
+        properties: dict = {}   # id  -> {…, collected, commission}
+        income_types: dict = {}  # key -> {…, collected, commission}
+
+        def _acc(bucket, key, base, collected, commission):
+            row = bucket.get(key)
+            if row is None:
+                row = dict(base, collected=Decimal('0'), commission=Decimal('0'))
+                bucket[key] = row
+            row['collected'] += collected
+            row['commission'] += commission
+
+        # --- Invoice-linked: one grouped DB query ---
+        inv_filter = Q(
+            invoice__isnull=False, invoice__unit__isnull=False,
+            invoice__unit__property__isnull=False, date__lte=end_date,
+        )
+        if start_date:
+            inv_filter &= Q(date__gte=start_date)
+        if landlord_id:
+            inv_filter &= Q(invoice__unit__property__landlord_id=landlord_id)
+
+        for row in Receipt.objects.filter(inv_filter).values(
+            'invoice__unit__property__landlord__id',
+            'invoice__unit__property__landlord__name',
+            'invoice__unit__property__landlord__code',
+            'invoice__unit__property__id',
+            'invoice__unit__property__name',
+            'invoice__invoice_type',
+        ).annotate(collected=Sum('amount'), commission=Sum(comm_expr)):
+            collected = row['collected'] or Decimal('0')
+            commission = row['commission'] or Decimal('0')
+            lid = row['invoice__unit__property__landlord__id']
+            pid = row['invoice__unit__property__id']
+            itype = row['invoice__invoice_type'] or 'other'
+            _acc(landlords, lid, {
+                'landlord_id': lid,
+                'landlord_name': row['invoice__unit__property__landlord__name'],
+                'landlord_code': row['invoice__unit__property__landlord__code'],
+            }, collected, commission)
+            _acc(properties, pid, {
+                'property_id': pid,
+                'property_name': row['invoice__unit__property__name'],
+                'landlord_id': lid,
+                'landlord_name': row['invoice__unit__property__landlord__name'],
+            }, collected, commission)
+            _acc(income_types, itype, {
+                'income_type': itype,
+                'income_type_display': invoice_type_choices.get(itype, itype),
+            }, collected, commission)
+
+        # --- Invoice-less direct payments: resolve via the tenant ---
+        ill = Receipt.objects.filter(invoice__isnull=True, date__lte=end_date)
+        if start_date:
+            ill = ill.filter(date__gte=start_date)
+        ill = _comparative_receipt_qs(ill)
+        rate_cache: dict = {}
+        for rcpt in ill:
+            dims = _receipt_dims(rcpt)
+            prop = dims['property']
+            landlord = dims['landlord']
+            if landlord_id and (not landlord or str(landlord.id) != str(landlord_id)):
+                continue
+            collected = rcpt.amount or Decimal('0')
+            pid_for_rate = prop.id if prop else None
+            rkey = (pid_for_rate, rcpt.income_type_id)
+            if rkey not in rate_cache:
+                rate_cache[rkey] = _resolve_commission_rate_pct(rcpt.income_type, pid_for_rate)
+            commission = collected * rate_cache[rkey] / 100
+            if landlord:
+                _acc(landlords, landlord.id, {
+                    'landlord_id': landlord.id, 'landlord_name': landlord.name,
+                    'landlord_code': getattr(landlord, 'code', ''),
+                }, collected, commission)
+            if prop:
+                _acc(properties, prop.id, {
+                    'property_id': prop.id, 'property_name': prop.name,
+                    'landlord_id': landlord.id if landlord else None,
+                    'landlord_name': landlord.name if landlord else None,
+                }, collected, commission)
+            _acc(income_types, dims['income_type_key'], {
+                'income_type': dims['income_type_key'],
+                'income_type_display': dims['income_type_display'],
+            }, collected, commission)
+
+        # --- Finalize ---
+        def _finalize(bucket):
+            out = []
+            for row in bucket.values():
+                collected = row['collected']
+                commission = row['commission']
+                blended = (commission / collected * 100) if collected else Decimal('0')
+                item = {k: v for k, v in row.items() if k not in ('collected', 'commission')}
+                item['collected'] = float(collected)
+                item['commission'] = float(commission)
+                item['commission_rate'] = float(blended)
+                out.append(item)
+            out.sort(key=lambda x: x['commission'], reverse=True)
+            return out
+
+        landlord_list = _finalize(landlords)
+        property_list = _finalize(properties)
+        income_type_list = _finalize(income_types)
+
+        total_collected = float(sum((r['collected'] for r in properties.values()), Decimal('0')))
+        total_commission = float(sum((r['commission'] for r in properties.values()), Decimal('0')))
+
+        for rank, item in enumerate(property_list, 1):
+            item['rank'] = rank
+            item['percentage'] = round(item['commission'] / total_commission * 100, 1) if total_commission else 0
+        for rank, item in enumerate(income_type_list, 1):
+            item['rank'] = rank
+            item['percentage'] = round(item['commission'] / total_commission * 100, 1) if total_commission else 0
+
+        return Response({
+            'report_name': 'Commission Report',
+            'period': {
+                'start': start_date,
+                'end': str(end_date)
+            },
+            'summary': {
+                'total_collected': total_collected,
+                'total_commission': total_commission,
+                'effective_rate': round(total_commission / total_collected * 100, 2) if total_collected else 0
+            },
+            'by_landlord': landlord_list,
+            'by_property': property_list,
+            'by_income_type': income_type_list,
+            # Chart data
+            'chart_data': {
+                'by_landlord': {
+                    'labels': [l['landlord_name'] for l in landlord_list[:10]],
+                    'values': [l['commission'] for l in landlord_list[:10]]
+                },
+                'by_income_type': {
+                    'labels': [i['income_type_display'] for i in income_type_list],
+                    'values': [i['commission'] for i in income_type_list]
+                }
+            }
+        })
+
+
+class CommissionPropertyDrilldownView(APIView):
+    """Drill-down for a single property's commission by revenue type."""
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        property_id = request.query_params.get('property_id')
+        if not property_id:
+            return Response({'error': 'property_id is required'}, status=400)
+
+        start_date = request.query_params.get('start_date')
+        end_date = request.query_params.get('end_date', str(timezone.now().date()))
+
+        try:
+            prop = Property.objects.select_related('landlord').get(id=property_id)
+        except Property.DoesNotExist:
+            return Response({'error': 'Property not found'}, status=404)
+
+        # Group receipts by invoice_type for this property
+        rcpt_filter = {
+            'invoice__unit__property_id': property_id,
+            'invoice__isnull': False,
+            'date__lte': end_date,
+        }
+        if start_date:
+            rcpt_filter['date__gte'] = start_date
+
+        invoice_type_choices = dict(Invoice._meta.get_field('invoice_type').flatchoices)
+
+        type_qs = Receipt.objects.filter(**rcpt_filter).values(
+            'invoice__invoice_type'
+        ).annotate(
+            collected=Coalesce(Sum('amount'), Decimal('0')),
+            commission=Coalesce(Sum(_commission_expr()), Decimal('0')),
+        ).order_by('-collected')
+
+        total_revenue = Decimal('0')
+        total_commission = Decimal('0')
+        revenue_types = []
+        for row in type_qs:
+            collected = Decimal(str(row['collected']))
+            commission = Decimal(str(row['commission']))
+            blended = (commission / collected * 100) if collected else Decimal('0')
+            total_revenue += collected
+            total_commission += commission
+            revenue_types.append({
+                'revenue_type': row['invoice__invoice_type'],
+                'revenue_type_display': invoice_type_choices.get(row['invoice__invoice_type'], row['invoice__invoice_type']),
+                'revenue': float(collected),
+                'commission_rate': float(blended),
+                'commission': float(commission),
+            })
+
+        total_revenue_f = float(total_revenue)
+        total_commission_f = float(total_commission)
+        overall_blended = float(total_commission / total_revenue * 100) if total_revenue else 0.0
+
+        # Calculate percentage of total for each type
+        for item in revenue_types:
+            item['percentage'] = round(item['revenue'] / total_revenue_f * 100, 1) if total_revenue_f else 0
+
+        return Response({
+            'level': 2,
+            'property_id': int(property_id),
+            'property_name': prop.name,
+            'landlord_name': prop.landlord.name if prop.landlord else '',
+            # Blended commission rate across this property (commission ÷ revenue × 100).
+            # The actual rate now varies per income_type, which is shown per row.
+            'commission_rate': overall_blended,
+            'period': {'start': start_date or '', 'end': end_date},
+            'revenue_types': revenue_types,
+            'summary': {
+                'total_revenue': total_revenue_f,
+                'total_commission': total_commission_f,
+            },
+        })
+
+
+class LeaseChargeSummaryView(APIView):
+    """
+    Lease Charge Summary – masterfile billing configuration.
+    Shows how each active lease is set up: charge type, currency,
+    amount, and commission rate.
+    """
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        property_id = request.query_params.get('property_id')
+        landlord_id = request.query_params.get('landlord_id')
+
+        # Get active leases
+        leases = LeaseAgreement.objects.filter(
+            status='active'
+        ).select_related(
+            'tenant', 'unit', 'unit__property', 'unit__property__landlord',
+        ).order_by('unit__property__name', 'unit__unit_number')
+
+        if property_id:
+            leases = leases.filter(unit__property_id=property_id)
+        if landlord_id:
+            leases = leases.filter(unit__property__landlord_id=landlord_id)
+
+        # Determine commission rate per lease from income_type on latest invoice
+        lease_ids = [l.id for l in leases]
+        # Get the income_type commission for each lease (from most recent invoice)
+        from django.db.models import Subquery, OuterRef
+        latest_inv_with_income = (
+            Invoice.objects.filter(lease_id=OuterRef('pk'), income_type__isnull=False)
+            .order_by('-date')
+            .values('income_type__default_commission_rate')[:1]
+        )
+        commission_map = {}
+        for row in LeaseAgreement.objects.filter(id__in=lease_ids).annotate(
+            income_commission=Subquery(latest_inv_with_income)
+        ).values('id', 'income_commission'):
+            commission_map[row['id']] = row['income_commission']
+
+        # Per-lease invoiced & collected totals so the table can show real
+        # numbers (Total Charged / Paid / Balance) instead of zeros. Done
+        # in two grouped queries to avoid N+1.
+        invoiced_map = {
+            row['lease_id']: row['total']
+            for row in Invoice.objects.filter(lease_id__in=lease_ids)
+            .values('lease_id').annotate(total=Sum('amount'))
+        }
+        collected_map = {
+            row['invoice__lease_id']: row['total']
+            for row in Receipt.objects.filter(invoice__lease_id__in=lease_ids)
+            .values('invoice__lease_id').annotate(total=Sum('amount'))
+        }
+
+        lease_type_labels = dict(LeaseAgreement.LeaseType.choices)
+        charges = []
+        total_amount = Decimal('0')
+
+        for lease in leases:
+            prop = lease.unit.property
+            landlord = prop.landlord
+
+            # Commission rate: per-(property, income_type) override → IncomeType
+            # default → 0%. Falls back to the income-type default surfaced by
+            # the lease's most recent invoice when no explicit override exists.
+            income_commission = commission_map.get(lease.id)
+            if income_commission is not None:
+                # When the lease's invoices map to an income_type, prefer the
+                # per-property override on that pair if one's been set.
+                from apps.masterfile.models import PropertyIncomeCommission
+                latest_inv = Invoice.objects.filter(
+                    lease_id=lease.id, income_type__isnull=False,
+                ).order_by('-date').values('income_type_id').first()
+                override = None
+                if latest_inv:
+                    override = PropertyIncomeCommission.objects.filter(
+                        property_id=prop.id, income_type_id=latest_inv['income_type_id'],
+                    ).values_list('rate', flat=True).first()
+                comm_rate = float(override) if override is not None else float(income_commission)
+            else:
+                # No commissionable income type linked — show 0% rather than the
+                # legacy landlord-flat fallback.
+                comm_rate = 0.0
+
+            # Build property display: "Name, Suburb, City" (matching spreadsheet)
+            parts = [prop.name]
+            if prop.suburb:
+                parts.append(prop.suburb)
+            parts.append(prop.city)
+            property_display = ', '.join(parts)
+
+            # Tenant display: "Name UnitNumber PropertyName"
+            tenant_display = f"{lease.tenant.name} {lease.unit.unit_number} {prop.name}"
+
+            # Charge type from lease_type
+            charge_type = lease_type_labels.get(lease.lease_type, lease.lease_type)
+            # Map to friendlier names
+            if lease.lease_type == 'levy':
+                charge_type = 'Levy'
+            elif lease.lease_type == 'rental':
+                charge_type = 'Rent'
+
+            invoiced = invoiced_map.get(lease.id) or Decimal('0')
+            collected = collected_map.get(lease.id) or Decimal('0')
+            balance = invoiced - collected
+
+            charges.append({
+                'lease_id': lease.id,
+                'lease_number': lease.lease_number,
+                'property_id': prop.id,
+                'property': property_display,
+                'property_name': prop.name,
+                'tenant_id': lease.tenant_id,
+                'tenant': tenant_display,
+                'tenant_name': lease.tenant.name,
+                'charge_type': charge_type,
+                'charge_currency': lease.currency,
+                'currency': lease.currency,
+                'charge_amount': float(lease.monthly_rent),
+                'monthly_rent': float(lease.monthly_rent),
+                'charge_commission': comm_rate,
+                # Per-lease running totals — what the LandlordDetail and
+                # Reports UI show in the Total Charged / Paid / Balance cols.
+                'total_charged': float(invoiced),
+                'total_paid': float(collected),
+                'balance': float(balance),
+                # Extra fields for navigation/filtering
+                'unit_id': lease.unit_id,
+                'unit': lease.unit.unit_number,
+                'unit_name': lease.unit.unit_number,
+                'landlord_id': landlord.id,
+                'landlord_name': landlord.name,
+            })
+            total_amount += lease.monthly_rent
+
+        return Response({
+            'report_name': 'Lease Charge Summary',
+            'summary': {
+                'total_leases': len(charges),
+                'total_charge_amount': float(total_amount),
+            },
+            'charges': charges,
+        })
+
+
+class ReceiptListingView(APIView):
+    """
+    Receipt Listing - Comprehensive receipt report.
+    Shows all receipts with bank account, income type, tenant, property details.
+    """
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        start_date = request.query_params.get('start_date')
+        end_date = request.query_params.get('end_date', timezone.now().date())
+        bank_account_id = request.query_params.get('bank_account_id')
+        income_type = request.query_params.get('income_type')
+        payment_method = request.query_params.get('payment_method')
+        export = request.query_params.get('export')  # 'csv' or 'excel'
+        limit = min(int(request.query_params.get('limit', 500)), 2000)
+
+        # Build queryset. Receipts are often captured WITHOUT an invoice
+        # (ad-hoc direct payments), so we also pull the receipt's own
+        # income_type and the paying tenant's unit / active lease — that's
+        # where Property / Unit / Income Type come from when no invoice
+        # exists. Without this they render blank in the listing.
+        from django.db.models import Prefetch
+        from apps.masterfile.models import LeaseAgreement as _Lease
+        active_leases = Prefetch(
+            'tenant__leases',
+            queryset=_Lease.objects.filter(status='active').select_related(
+                'unit', 'unit__property', 'unit__property__landlord',
+                'property', 'property__landlord',
+            ),
+            to_attr='_active_leases',
+        )
+        receipts = Receipt.objects.select_related(
+            'tenant', 'tenant__unit', 'tenant__unit__property',
+            'tenant__unit__property__landlord',
+            'invoice', 'invoice__unit', 'invoice__unit__property',
+            'invoice__unit__property__landlord',
+            'invoice__property', 'invoice__property__landlord',
+            'income_type', 'bank_account', 'created_by',
+        ).prefetch_related(active_leases).filter(date__lte=end_date)
+
+        if start_date:
+            receipts = receipts.filter(date__gte=start_date)
+        if bank_account_id:
+            receipts = receipts.filter(bank_account_id=bank_account_id)
+        if income_type:
+            # Match the receipt's own income_type code OR the linked
+            # invoice's type, so invoice-less receipts filter correctly.
+            receipts = receipts.filter(
+                Q(income_type__code__iexact=income_type) |
+                Q(invoice__invoice_type=income_type)
+            )
+        if payment_method:
+            receipts = receipts.filter(payment_method=payment_method)
+
+        receipts = receipts.order_by('-date', '-created_at')[:limit]
+
+        def _resolve_unit_property(rcpt):
+            """(unit, property) for a receipt — invoice first, then the
+            tenant's direct unit, then their active lease."""
+            inv = rcpt.invoice
+            if inv and inv.unit:
+                return inv.unit, inv.unit.property
+            if inv and inv.property_id:
+                return None, inv.property
+            t = rcpt.tenant
+            if t and t.unit:
+                return t.unit, t.unit.property
+            for lease in getattr(t, '_active_leases', None) or []:
+                if lease.unit:
+                    return lease.unit, lease.unit.property
+                if lease.property_id:
+                    return None, lease.property
+            return None, None
+
+        # Build receipt list
+        receipt_list = []
+        total_amount = Decimal('0')
+        totals_by_bank = {}
+        totals_by_income_type = {}
+
+        for rcpt in receipts:
+            unit_obj, prop_obj = _resolve_unit_property(rcpt)
+            property_name = prop_obj.name if prop_obj else None
+            property_id = prop_obj.id if prop_obj else None
+            unit_number = unit_obj.unit_number if unit_obj else None
+            unit_id = unit_obj.id if unit_obj else None
+            landlord_name = prop_obj.landlord.name if prop_obj and prop_obj.landlord_id else None
+
+            # Income type — the receipt's own income_type wins (always set
+            # on direct payments); fall back to the invoice's type.
+            if rcpt.income_type:
+                type_key = (rcpt.income_type.code or '').lower() or 'other'
+                type_display = rcpt.income_type.name
+            elif rcpt.invoice and rcpt.invoice.invoice_type:
+                type_key = rcpt.invoice.invoice_type
+                type_display = rcpt.invoice.get_invoice_type_display()
+            else:
+                type_key = 'other'
+                type_display = 'Other'
+
+            bank_name = rcpt.bank_account.name if rcpt.bank_account else (rcpt.bank_name or None)
+
+            receipt_list.append({
+                'receipt_id': rcpt.id,
+                'date': str(rcpt.date),
+                'receipt_number': rcpt.receipt_number,
+                'tenant_id': rcpt.tenant.id,
+                'tenant_code': rcpt.tenant.code,
+                'tenant_name': rcpt.tenant.name,
+                'landlord_name': landlord_name,
+                'property_id': property_id,
+                'property_name': property_name,
+                'unit_id': unit_id,
+                'unit_number': unit_number,
+                'unit_name': unit_number,  # alias for the frontend column
+                'income_type': type_display,       # human-readable label
+                'income_type_key': type_key,       # raw key for filtering
+                'income_type_display': type_display,
+                'bank_account': bank_name,
+                'payment_method': rcpt.payment_method,
+                'payment_method_display': rcpt.get_payment_method_display(),
+                'reference': rcpt.reference,
+                'currency': rcpt.currency,
+                'amount': float(rcpt.amount)
+            })
+
+            total_amount += rcpt.amount
+
+            # Aggregate by bank
+            bank_key = bank_name or 'Unknown'
+            if bank_key not in totals_by_bank:
+                totals_by_bank[bank_key] = Decimal('0')
+            totals_by_bank[bank_key] += rcpt.amount
+
+            # Aggregate by income type
+            if type_display not in totals_by_income_type:
+                totals_by_income_type[type_display] = Decimal('0')
+            totals_by_income_type[type_display] += rcpt.amount
+
+        # Handle export
+        if export == 'csv':
+            return self._export_csv(receipt_list)
+
+        return Response({
+            'report_name': 'Receipt Listing',
+            'period': {
+                'start': start_date,
+                'end': str(end_date)
+            },
+            'filters': {
+                'bank_account_id': bank_account_id,
+                'income_type': income_type,
+                'payment_method': payment_method
+            },
+            'summary': {
+                'total_receipts': len(receipt_list),
+                'total_amount': float(total_amount),
+                'by_bank': {k: float(v) for k, v in totals_by_bank.items()},
+                'by_income_type': {k: float(v) for k, v in totals_by_income_type.items()}
+            },
+            'receipts': receipt_list,
+            'chart_data': {
+                'by_bank': {
+                    'labels': list(totals_by_bank.keys()),
+                    'values': [float(v) for v in totals_by_bank.values()]
+                },
+                'by_income_type': {
+                    'labels': list(totals_by_income_type.keys()),
+                    'values': [float(v) for v in totals_by_income_type.values()]
+                }
+            }
+        })
+
+    def _export_csv(self, receipt_list):
+        """Export receipt listing to CSV."""
+        output = io.StringIO()
+        writer = csv.writer(output)
+
+        # Header
+        writer.writerow([
+            'Date', 'Receipt Number', 'Tenant Code', 'Tenant Name',
+            'Landlord', 'Property', 'Unit', 'Income Type',
+            'Bank Account', 'Payment Method', 'Reference', 'Currency', 'Amount'
+        ])
+
+        # Data
+        for rcpt in receipt_list:
+            writer.writerow([
+                rcpt['date'], rcpt['receipt_number'], rcpt['tenant_code'],
+                rcpt['tenant_name'], rcpt['landlord_name'], rcpt['property_name'],
+                rcpt['unit_number'], rcpt['income_type_display'],
+                rcpt['bank_account'], rcpt['payment_method_display'],
+                rcpt['reference'], rcpt['currency'], rcpt['amount']
+            ])
+
+        response = HttpResponse(output.getvalue(), content_type='text/csv')
+        response['Content-Disposition'] = 'attachment; filename="receipt_listing.csv"'
+        return response
+
+
+class CommissionAnalysisView(APIView):
+    """
+    Commission Analysis - Detailed commission breakdown.
+    Includes pie charts and bar charts data for visualization.
+    """
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        start_date = request.query_params.get('start_date')
+        end_date = request.query_params.get('end_date', timezone.now().date())
+
+        # Receipts (incl. invoice-less direct payments) with the chains
+        # _receipt_dims needs to resolve property / income-type via the
+        # tenant when no invoice is present.
+        receipts = Receipt.objects.filter(date__lte=end_date)
+        if start_date:
+            receipts = receipts.filter(date__gte=start_date)
+        receipts = _comparative_receipt_qs(receipts)
+
+        # Calculate commissions
+        by_income_type = {}
+        by_property = {}
+        by_month = {}
+        total_income = Decimal('0')
+        total_commission = Decimal('0')
+        rate_cache: dict = {}
+
+        for rcpt in receipts:
+            dims = _receipt_dims(rcpt)
+            prop = dims['property']
+            income_type = dims['income_type_key']
+            pid_for_rate = prop.id if prop else None
+            rkey = (pid_for_rate, rcpt.income_type_id)
+            if rkey not in rate_cache:
+                rate_cache[rkey] = _resolve_commission_rate_pct(rcpt.income_type, pid_for_rate) / 100
+            commission = rcpt.amount * rate_cache[rkey]
+            month_key = rcpt.date.strftime('%Y-%m')
+
+            # By income type
+            if income_type not in by_income_type:
+                by_income_type[income_type] = {
+                    'label': dims['income_type_display'],
+                    'income': Decimal('0'),
+                    'commission': Decimal('0')
+                }
+            by_income_type[income_type]['income'] += rcpt.amount
+            by_income_type[income_type]['commission'] += commission
+
+            # By property (only when the receipt resolves to one)
+            if prop is not None:
+                if prop.id not in by_property:
+                    by_property[prop.id] = {
+                        'property_id': prop.id,
+                        'property_name': prop.name,
+                        'income': Decimal('0'),
+                        'commission': Decimal('0')
+                    }
+                by_property[prop.id]['income'] += rcpt.amount
+                by_property[prop.id]['commission'] += commission
+
+            # By month (for trend chart)
+            if month_key not in by_month:
+                by_month[month_key] = {
+                    'month': month_key,
+                    'income': Decimal('0'),
+                    'commission': Decimal('0')
+                }
+            by_month[month_key]['income'] += rcpt.amount
+            by_month[month_key]['commission'] += commission
+
+            total_income += rcpt.amount
+            total_commission += commission
+
+        # Serialize and prepare chart data
+        income_type_data = [
+            {
+                'income_type': k,
+                'label': v['label'],
+                'income': float(v['income']),
+                'commission': float(v['commission']),
+                'percentage': round(float(v['commission']) / float(total_commission) * 100, 1) if total_commission else 0
+            }
+            for k, v in by_income_type.items()
+        ]
+        income_type_data.sort(key=lambda x: x['commission'], reverse=True)
+
+        property_data = [
+            {
+                'property_id': v['property_id'],
+                'property_name': v['property_name'],
+                'income': float(v['income']),
+                'commission': float(v['commission']),
+                'percentage': round(float(v['commission']) / float(total_commission) * 100, 1) if total_commission else 0
+            }
+            for v in by_property.values()
+        ]
+        property_data.sort(key=lambda x: x['commission'], reverse=True)
+
+        month_data = [
+            {
+                'month': k,
+                'income': float(v['income']),
+                'commission': float(v['commission'])
+            }
+            for k, v in sorted(by_month.items())
+        ]
+
+        return Response({
+            'report_name': 'Commission Analysis',
+            'period': {
+                'start': start_date,
+                'end': str(end_date)
+            },
+            'summary': {
+                'total_income': float(total_income),
+                'total_commission': float(total_commission),
+                'effective_rate': round(float(total_commission) / float(total_income) * 100, 2) if total_income else 0
+            },
+            'by_income_type': income_type_data,
+            'by_property': property_data,
+            'by_month': month_data,
+            # Pie chart data
+            'pie_chart': {
+                'by_income_type': {
+                    'labels': [d['label'] for d in income_type_data],
+                    'values': [d['commission'] for d in income_type_data]
+                },
+                'by_property': {
+                    'labels': [d['property_name'] for d in property_data[:10]],
+                    'values': [d['commission'] for d in property_data[:10]]
+                }
+            },
+            # Bar chart data
+            'bar_chart': {
+                'monthly_trend': {
+                    'labels': [d['month'] for d in month_data],
+                    'income': [d['income'] for d in month_data],
+                    'commission': [d['commission'] for d in month_data]
+                }
+            }
+        })
+
+
+class IncomeItemAnalysisView(APIView):
+    """
+    Income Item Analysis - Analysis by income type and bank account.
+    Shows which bank accounts hold transactions for specific income items.
+    """
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        start_date = request.query_params.get('start_date')
+        end_date = request.query_params.get('end_date', timezone.now().date())
+        income_type = request.query_params.get('income_type')
+        bank_account_id = request.query_params.get('bank_account_id')
+
+        # Get receipts
+        receipts = Receipt.objects.filter(date__lte=end_date)
+        if start_date:
+            receipts = receipts.filter(date__gte=start_date)
+        if income_type:
+            # Match the receipt's own income_type OR the linked invoice's
+            # type so invoice-less receipts filter correctly.
+            receipts = receipts.filter(
+                Q(income_type__code__iexact=income_type) |
+                Q(invoice__invoice_type=income_type)
+            )
+        if bank_account_id:
+            receipts = receipts.filter(bank_account_id=bank_account_id)
+
+        receipts = _comparative_receipt_qs(receipts)
+
+        # Build analysis matrix: income_type x bank_account
+        matrix = {}
+        income_types = set()
+        bank_accounts = {}  # bank_name -> bank_id
+        totals_by_type = {}
+        totals_by_bank = {}
+        grand_total = Decimal('0')
+
+        for rcpt in receipts:
+            # Income type from the receipt's own income_type, falling back
+            # to the invoice — invoice-less payments would otherwise all
+            # land under "Other".
+            _dims = _receipt_dims(rcpt)
+            inv_type = _dims['income_type_key']
+            inv_type_display = _dims['income_type_display']
+            bank_id = rcpt.bank_account_id if rcpt.bank_account else None
+            bank_name = rcpt.bank_account.name if rcpt.bank_account else (rcpt.bank_name or 'Cash')
+
+            income_types.add((inv_type, inv_type_display))
+            if bank_name not in bank_accounts:
+                bank_accounts[bank_name] = bank_id
+
+            matrix_key = (inv_type, bank_name)
+            if matrix_key not in matrix:
+                matrix[matrix_key] = Decimal('0')
+            matrix[matrix_key] += rcpt.amount
+
+            # Totals
+            if inv_type not in totals_by_type:
+                totals_by_type[inv_type] = {'label': inv_type_display, 'amount': Decimal('0')}
+            totals_by_type[inv_type]['amount'] += rcpt.amount
+
+            if bank_name not in totals_by_bank:
+                totals_by_bank[bank_name] = Decimal('0')
+            totals_by_bank[bank_name] += rcpt.amount
+
+            grand_total += rcpt.amount
+
+        # Build structured bank columns with id, key, label
+        bank_list = sorted(bank_accounts.keys())
+        bank_columns = []
+        for bank_name in bank_list:
+            key = f'bank_{bank_accounts[bank_name]}' if bank_accounts[bank_name] else bank_name.lower().replace(' ', '_')
+            bank_columns.append({
+                'key': key,
+                'label': bank_name,
+                'id': bank_accounts[bank_name],
+            })
+
+        type_list = sorted(income_types, key=lambda x: x[1])
+
+        # Build flattened matrix rows (amounts at row[col.key])
+        matrix_data = []
+        for inv_type, inv_type_display in type_list:
+            row = {
+                'income_type': inv_type,
+                'income_type_display': inv_type_display,
+                'total': float(totals_by_type.get(inv_type, {}).get('amount', 0))
+            }
+            for col in bank_columns:
+                row[col['key']] = float(matrix.get((inv_type, col['label']), 0))
+            matrix_data.append(row)
+
+        # Build totals keyed by column key
+        totals = {'grand_total': float(grand_total)}
+        for col in bank_columns:
+            totals[col['key']] = float(totals_by_bank.get(col['label'], 0))
+
+        return Response({
+            'report_name': 'Income Item Analysis',
+            'period': {
+                'start': start_date,
+                'end': str(end_date)
+            },
+            'filters': {
+                'income_type': income_type,
+                'bank_account_id': bank_account_id
+            },
+            'summary': {
+                'grand_total': float(grand_total),
+                'income_types_count': len(type_list),
+                'bank_accounts_count': len(bank_list)
+            },
+            'totals_by_income_type': [
+                {'income_type': k, 'label': v['label'], 'amount': float(v['amount'])}
+                for k, v in totals_by_type.items()
+            ],
+            'totals_by_bank': [
+                {'bank': k, 'amount': float(v)}
+                for k, v in totals_by_bank.items()
+            ],
+            'matrix': matrix_data,
+            'bank_columns': bank_columns,
+            'totals': totals,
+            # Heatmap data for visualization
+            'heatmap_data': {
+                'x_labels': bank_list,
+                'y_labels': [t[1] for t in type_list],
+                'values': [
+                    [float(matrix.get((t[0], b), 0)) for b in bank_list]
+                    for t in type_list
+                ]
+            }
+        })
+
+
+class IncomeItemDrilldownView(APIView):
+    """
+    Drill-down for Income Item Analysis.
+    Level 2: Income categories for a specific bank account.
+    Level 3: Individual receipts for a bank + income category.
+    """
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        level = request.query_params.get('level', '2')
+        bank_account_id = request.query_params.get('bank_account_id')
+        income_type = request.query_params.get('income_type')
+        start_date = request.query_params.get('start_date')
+        end_date = request.query_params.get('end_date', timezone.now().date())
+
+        if not bank_account_id:
+            return Response({'error': 'bank_account_id is required'}, status=400)
+
+        # Base queryset
+        receipts = Receipt.objects.filter(
+            bank_account_id=bank_account_id,
+            date__lte=end_date,
+        )
+        if start_date:
+            receipts = receipts.filter(date__gte=start_date)
+
+        # Get bank account name
+        try:
+            bank_account = BankAccount.objects.get(pk=bank_account_id)
+            bank_account_name = bank_account.name
+        except BankAccount.DoesNotExist:
+            return Response({'error': 'Bank account not found'}, status=404)
+
+        if level == '3':
+            # Level 3: Individual receipts for bank + income type
+            if not income_type:
+                return Response({'error': 'income_type is required for level 3'}, status=400)
+
+            receipts = receipts.filter(
+                invoice__invoice_type=income_type
+            ).select_related(
+                'tenant', 'invoice__property', 'invoice__unit', 'invoice'
+            ).order_by('-date')
+
+            receipt_list = []
+            total = Decimal('0')
+            for rcpt in receipts:
+                prop_name = ''
+                unit_name = ''
+                if rcpt.invoice:
+                    prop_name = rcpt.invoice.property.name if rcpt.invoice.property else ''
+                    unit_name = rcpt.invoice.unit.unit_number if rcpt.invoice.unit else ''
+                receipt_list.append({
+                    'receipt_id': rcpt.id,
+                    'date': str(rcpt.date),
+                    'receipt_number': rcpt.receipt_number,
+                    'property_id': rcpt.invoice.property_id if rcpt.invoice and rcpt.invoice.property else None,
+                    'property': prop_name,
+                    'unit_id': rcpt.invoice.unit_id if rcpt.invoice and rcpt.invoice.unit else None,
+                    'unit': unit_name,
+                    'tenant_id': rcpt.tenant_id if rcpt.tenant else None,
+                    'tenant': str(rcpt.tenant) if rcpt.tenant else '',
+                    'amount': float(rcpt.amount),
+                })
+                total += rcpt.amount
+
+            # Get display name for income type
+            income_type_display = income_type
+            for choice_val, choice_label in Invoice.InvoiceType.choices:
+                if choice_val == income_type:
+                    income_type_display = choice_label
+                    break
+
+            return Response({
+                'level': 3,
+                'bank_account_name': bank_account_name,
+                'income_type': income_type,
+                'income_type_display': income_type_display,
+                'receipts': receipt_list,
+                'total': float(total),
+                'transaction_count': len(receipt_list),
+            })
+
+        else:
+            # Level 2: Categories breakdown for a bank
+            receipts = receipts.select_related('invoice')
+            categories = {}
+            grand_total = Decimal('0')
+
+            for rcpt in receipts:
+                inv_type = rcpt.invoice.invoice_type if rcpt.invoice else 'other'
+                inv_type_display = rcpt.invoice.get_invoice_type_display() if rcpt.invoice else 'Other'
+
+                if inv_type not in categories:
+                    categories[inv_type] = {
+                        'income_type': inv_type,
+                        'income_type_display': inv_type_display,
+                        'transaction_count': 0,
+                        'total_amount': Decimal('0'),
+                    }
+                categories[inv_type]['transaction_count'] += 1
+                categories[inv_type]['total_amount'] += rcpt.amount
+                grand_total += rcpt.amount
+
+            cat_list = sorted(categories.values(), key=lambda x: x['income_type_display'])
+            for cat in cat_list:
+                cat['total_amount'] = float(cat['total_amount'])
+
+            return Response({
+                'level': 2,
+                'bank_account_name': bank_account_name,
+                'categories': cat_list,
+                'grand_total': float(grand_total),
+                'total_transactions': sum(c['transaction_count'] for c in cat_list),
+            })
+
+
+class IncomeExpenditureReportView(APIView):
+    """
+    Income & Expenditure Report – monthly columnar view matching the
+    A1-A5 spec (Sunset Financials spreadsheet).
+
+    Sections returned:
+    1. months[]          – per-month income by category, expenditure by category, balance
+    2. consolidated      – year-to-date totals
+    3. income_summary    – per-tenant/account-holder rollover
+    4. working_capital   – debtors, creditors, net working capital
+    5. income_items[]    – category-level income totals (for chart in LandlordDetail)
+    6. expense_items[]   – category-level expense totals (for chart in LandlordDetail)
+    """
+    permission_classes = [IsAuthenticated]
+
+    # ── helpers ──────────────────────────────────────────────────────
+
+    @staticmethod
+    def _month_range(start_date, end_date):
+        """Yield (month_start, month_end, label) for every month in the range."""
+        from calendar import monthrange
+        cursor = start_date.replace(day=1)
+        while cursor <= end_date:
+            _, last_day = monthrange(cursor.year, cursor.month)
+            month_end = cursor.replace(day=last_day)
+            yield cursor, min(month_end, end_date), cursor.strftime('%B %Y')
+            if cursor.month == 12:
+                cursor = cursor.replace(year=cursor.year + 1, month=1)
+            else:
+                cursor = cursor.replace(month=cursor.month + 1)
+
+    @staticmethod
+    def _compute_commission_amount(receipt, landlord):
+        # `landlord` arg kept for signature stability; not consulted any
+        # more. Rate now resolves per (property, income_type) via the
+        # PropertyIncomeCommission table.
+        #
+        # Delegates property resolution to Receipt._resolve_property_for_commission
+        # so this report-side helper picks up the same fallback chain
+        # (invoice.unit → invoice.property → invoice.lease.* → active
+        # lease) that the receipt-time resolver uses. Keeping the chain
+        # in one place avoids the kind of drift that previously caused
+        # the override to be ignored on invoice-less receipts.
+        from apps.billing.models import Receipt as _Receipt
+        prop_id = _Receipt._resolve_property_for_commission(receipt)
+        rate = _resolve_commission_rate_pct(receipt.income_type, prop_id) / 100
+        return receipt.amount * rate
+
+    # ── expense label map ────────────────────────────────────────────
+    EXPENSE_LABELS = {
+        'maintenance': 'Repairs and Maintenance',
+        'utility': 'Utilities',
+        'commission': 'Commission',
+        'landlord_payment': 'Landlord Payment',
+        'other': 'Other Expenses',
+    }
+
+    # ── income category display names ─────────────────────────────────
+    INVOICE_TYPE_LABELS = {
+        'rent': 'Rent',
+        'levy': 'Levy',
+        'special_levy': 'Special Levy',
+        'maintenance': 'Maintenance',
+        'parking': 'Parking',
+        'rates': 'Rates',
+        'deposit': 'Deposit',
+        'penalty': 'Late Payment Penalty',
+        'utility': 'Utility',
+        'vat': 'VAT',
+        'other': 'Other',
+    }
+
+    # Category ordering by management type
+    LEVY_INCOME_ORDER = ['levy', 'special_levy', 'maintenance', 'parking', 'rates']
+    RENTAL_INCOME_ORDER = ['rent', 'rates', 'maintenance', 'parking']
+
+    # ── receipt base queryset helper ─────────────────────────────────
+
+    @staticmethod
+    def _receipt_base_qs(unit_id_list, property_id_list, currency=None):
+        """Apply the shared scope helper. Uses `_scoped_receipt_qs` so the
+        OR'd JOINs from `_receipt_scope_q` don't break later
+        `.aggregate(_commission_expr())` calls (the OuterRef subquery in
+        _commission_expr can't bind through a DISTINCT wrapper)."""
+        qs = _scoped_receipt_qs(unit_id_list, property_id_list)
+        if currency:
+            qs = qs.filter(currency=currency)
+        return qs
+
+    # ── main handler ─────────────────────────────────────────────────
+
+    def get(self, request):
+        landlord_id = request.query_params.get('landlord_id')
+        property_id = request.query_params.get('property_id')
+
+        if not landlord_id and not property_id:
+            return Response({'error': 'landlord_id or property_id is required'}, status=400)
+
+        # Resolve landlord + properties
+        if landlord_id:
+            try:
+                landlord = Landlord.objects.get(id=landlord_id)
+            except Landlord.DoesNotExist:
+                return Response({'error': 'Landlord not found'}, status=404)
+            properties = landlord.properties.all()
+            entity_name = landlord.name
+            entity_type = 'landlord'
+        else:
+            try:
+                prop = Property.objects.get(id=property_id)
+            except Property.DoesNotExist:
+                return Response({'error': 'Property not found'}, status=404)
+            landlord = prop.landlord
+            properties = Property.objects.filter(id=property_id)
+            entity_name = prop.name
+            entity_type = 'property'
+
+        property_names = list(properties.values_list('name', flat=True))
+        property_id_list = list(properties.values_list('id', flat=True))
+        units = Unit.objects.filter(property__in=properties)
+
+        # Determine management type(s) for income category ordering
+        mgmt_types = set(properties.values_list('management_type', flat=True))
+        is_levy = 'levy' in mgmt_types
+        income_order = self.LEVY_INCOME_ORDER if is_levy else self.RENTAL_INCOME_ORDER
+
+        # Date range – default to full current year
+        today = timezone.now().date()
+        start_date = request.query_params.get('start_date')
+        end_date = request.query_params.get('end_date')
+        if not start_date:
+            start_date = today.replace(month=1, day=1)
+        else:
+            start_date = date.fromisoformat(str(start_date))
+        if not end_date:
+            end_date = today
+        else:
+            end_date = date.fromisoformat(str(end_date))
+
+        # Currency filter – default to USD
+        currency = request.query_params.get('currency', '').upper() or None
+
+        # Legacy single-rate metadata. Now resolves per (property, income_type)
+        # so there's no single rate to surface — kept at 0 for clients that
+        # still read this field. Real commission appears in `commission_total`.
+        commission_rate = 0.0
+
+        # ── 1. Opening balance (all transactions BEFORE start_date) ──
+        # Pre-evaluate unit IDs to avoid repeated subquery evaluation
+        unit_id_list = list(units.values_list('id', flat=True))
+
+        # Commission SQL expression — per-(property, income_type) override → IncomeType default → 0
+        commission_expr = _commission_expr()
+
+        # Aggregate prior receipts total and commission in SQL (avoids loading
+        # every historical receipt into Python memory — the old per-receipt loop
+        # caused OOM / connection drops for landlords with large history).
+        prior_receipt_qs = self._receipt_base_qs(unit_id_list, property_id_list, currency).filter(
+            date__lt=start_date,
+        )
+        prior_agg = prior_receipt_qs.aggregate(
+            receipts_total=Sum('amount'),
+            commissions_total=Sum(commission_expr),
+        )
+        prior_receipts_total = prior_agg['receipts_total'] or Decimal('0')
+        prior_commissions_total = prior_agg['commissions_total'] or Decimal('0')
+
+        # Income & Expenditure is a cash-basis report — accruals (non-cash
+        # expenses) belong on the P&L, not here. Exclude them from both the
+        # opening-balance and period totals so reported expenditure reflects
+        # actual cash movements out of the landlord's funds.
+        prior_expense_qs = Expense.objects.filter(
+            payee_type='landlord', payee_id=landlord.id,
+            status='paid', date__lt=start_date,
+        ).exclude(expense_kind='non_cash')
+        if currency:
+            prior_expense_qs = prior_expense_qs.filter(currency=currency)
+        prior_expenses_total = prior_expense_qs.aggregate(t=Sum('amount'))['t'] or Decimal('0')
+
+        opening_balance = prior_receipts_total - prior_commissions_total - prior_expenses_total
+
+        # ── 2. Period receipts + expenses (eager load once) ──
+        period_receipt_qs = self._receipt_base_qs(unit_id_list, property_id_list, currency).filter(
+            date__gte=start_date, date__lte=end_date,
+        ).select_related(
+            'income_type', 'tenant', 'invoice', 'invoice__unit',
+            'invoice__unit__property',
+        ).order_by('date')
+
+        period_receipts = list(period_receipt_qs)
+
+        period_expense_qs = Expense.objects.filter(
+            payee_type='landlord', payee_id=landlord.id,
+            status='paid',
+            date__gte=start_date, date__lte=end_date,
+        ).exclude(expense_kind='non_cash')
+        if currency:
+            period_expense_qs = period_expense_qs.filter(currency=currency)
+        period_expenses = list(
+            period_expense_qs.select_related('expense_category').order_by('date')
+        )
+
+        # ── 3. Build per-month data ─────────────────────────────────
+        months = []
+        running_balance = opening_balance
+        # Collect all unique income and expense category keys seen
+        all_income_types = set()
+        all_expense_types = set()
+        all_commission_types: set = set()
+
+        def _get_expense_key(e):
+            """Return a stable category key for an expense, preferring
+            expense_category.name if set, falling back to expense_type."""
+            if e.expense_category_id and e.expense_category:
+                return e.expense_category.name
+            return e.expense_type
+
+        def _invoice_type_key(receipt):
+            """Revenue category for a receipt. Prefer the linked invoice's
+            type, but fall back to the receipt's income_type code (direct
+            payments carry no invoice). IncomeType codes (RENT, LEVY,
+            SPECIAL_LEVY, …) lower-case to the same keys as invoice_type, so
+            labels and ordering line up either way. 'other' only when both
+            are missing."""
+            if receipt.invoice and receipt.invoice.invoice_type:
+                return receipt.invoice.invoice_type
+            if receipt.income_type and receipt.income_type.code:
+                return receipt.income_type.code.lower()
+            return 'other'
+
+        for m_start, m_end, m_label in self._month_range(start_date, end_date):
+            # Filter receipts and expenses for this month
+            m_receipts = [r for r in period_receipts if m_start <= r.date <= m_end]
+            m_expenses = [e for e in period_expenses if m_start <= e.date <= m_end]
+
+            # ── Income grouped by invoice_type ──
+            income_by_cat = {}
+            for r in m_receipts:
+                itype = _invoice_type_key(r)
+                income_by_cat[itype] = income_by_cat.get(itype, Decimal('0')) + r.amount
+            all_income_types.update(income_by_cat.keys())
+
+            total_income = sum(income_by_cat.values(), Decimal('0'))
+            amount_before = running_balance + total_income
+
+            # ── Expenses grouped by category ──
+            exp_by_type = {}
+            for e in m_expenses:
+                ekey = _get_expense_key(e)
+                exp_by_type[ekey] = exp_by_type.get(ekey, Decimal('0')) + e.amount
+            all_expense_types.update(exp_by_type.keys())
+
+            # Management commission — computed per receipt and grouped by
+            # income type (rent, maintenance, parking, …). Different income
+            # types can carry different rates per (property, income_type)
+            # via PropertyIncomeCommission, so we surface each separately.
+            mgmt_commission = Decimal('0')
+            mgmt_by_type: dict = {}
+            for r in m_receipts:
+                amt = self._compute_commission_amount(r, landlord)
+                if amt == 0:
+                    continue
+                mgmt_commission += amt
+                key = (
+                    r.income_type.name if r.income_type and getattr(r.income_type, 'name', None)
+                    else 'Other'
+                )
+                mgmt_by_type[key] = mgmt_by_type.get(key, Decimal('0')) + amt
+            all_commission_types.update(mgmt_by_type.keys())
+
+            total_exp = sum(exp_by_type.values(), Decimal('0')) + mgmt_commission
+            balance_cf = amount_before - total_exp
+            running_balance = balance_cf
+
+            months.append({
+                'month': m_start.strftime('%Y-%m'),
+                'label': m_label,
+                'balance_bf': float(amount_before - total_income),
+                # Keep backward-compat 'levies' key (sum of all income categories)
+                'levies': float(total_income),
+                'total_income': float(total_income),
+                # New: per-category income breakdown
+                'income_categories': {
+                    itype: float(amt) for itype, amt in income_by_cat.items()
+                },
+                'amount_before_expenditure': float(amount_before),
+                'expenditure_categories': {
+                    etype: float(amt) for etype, amt in exp_by_type.items()
+                },
+                'management_commission': float(mgmt_commission),
+                # Per-income-type commission rows so the columnar view can
+                # render "Commission - Rent", "Commission - Parking", etc.
+                # as separate lines under Expenditure.
+                'management_commission_by_type': {
+                    k: float(v) for k, v in mgmt_by_type.items()
+                },
+                'total_expenditure': float(total_exp),
+                'balance_cf': float(balance_cf),
+            })
+
+        # Ensure every month has every category key (fill missing with 0)
+        for m in months:
+            for itype in all_income_types:
+                m['income_categories'].setdefault(itype, 0.0)
+            for etype in all_expense_types:
+                m['expenditure_categories'].setdefault(etype, 0.0)
+            for ctype in all_commission_types:
+                m['management_commission_by_type'].setdefault(ctype, 0.0)
+
+        # ── 4. Consolidated totals ───────────────────────────────────
+        con_levies = sum(m['levies'] for m in months)
+        con_income_by_cat = {}
+        for m in months:
+            for itype, amt in m['income_categories'].items():
+                con_income_by_cat[itype] = con_income_by_cat.get(itype, 0.0) + amt
+        con_exp_by_type = {}
+        for m in months:
+            for etype, amt in m['expenditure_categories'].items():
+                con_exp_by_type[etype] = con_exp_by_type.get(etype, 0.0) + amt
+        con_commission = sum(m['management_commission'] for m in months)
+        con_commission_by_type: dict = {}
+        for m in months:
+            for ctype, amt in m['management_commission_by_type'].items():
+                con_commission_by_type[ctype] = con_commission_by_type.get(ctype, 0.0) + amt
+        con_total_exp = sum(m['total_expenditure'] for m in months)
+
+        consolidated = {
+            'balance_bf': float(opening_balance),
+            'levies': con_levies,
+            'total_income': float(opening_balance) + con_levies,
+            'income_categories': con_income_by_cat,
+            'expenditure_categories': con_exp_by_type,
+            'management_commission': con_commission,
+            'management_commission_by_type': con_commission_by_type,
+            'total_expenditure': con_total_exp,
+            'balance_cf': float(running_balance),
+        }
+
+        # ── 5. Income + Expense category labels (ordered, with nice names) ──
+
+        # Income category labels
+        income_category_labels = []
+        seen_income = set()
+        for itype in income_order:
+            if itype in all_income_types:
+                income_category_labels.append({
+                    'key': itype,
+                    'label': self.INVOICE_TYPE_LABELS.get(itype, itype.replace('_', ' ').title()),
+                })
+                seen_income.add(itype)
+        for itype in sorted(all_income_types - seen_income):
+            income_category_labels.append({
+                'key': itype,
+                'label': self.INVOICE_TYPE_LABELS.get(itype, itype.replace('_', ' ').title()),
+            })
+
+        # Expense category labels
+        expense_category_labels = []
+        ordered_types = ['maintenance', 'utility', 'commission', 'landlord_payment', 'other']
+        # Also match by ExpenseCategory name
+        ordered_names = ['Repairs and Maintenance', 'Electricity', 'Utilities',
+                         'Salaries', 'Security', 'Rates']
+        seen_exp = set()
+        # First: known expense_type keys
+        for etype in ordered_types:
+            if etype in all_expense_types:
+                expense_category_labels.append({
+                    'key': etype,
+                    'label': self.EXPENSE_LABELS.get(etype, etype),
+                })
+                seen_exp.add(etype)
+        # Second: known expense category names in spec order
+        for ename in ordered_names:
+            if ename in all_expense_types and ename not in seen_exp:
+                expense_category_labels.append({
+                    'key': ename,
+                    'label': ename,
+                })
+                seen_exp.add(ename)
+        # Remaining
+        for etype in sorted(all_expense_types - seen_exp):
+            expense_category_labels.append({
+                'key': etype,
+                'label': self.EXPENSE_LABELS.get(etype, etype.replace('_', ' ').title())
+                         if etype in self.EXPENSE_LABELS else etype,
+            })
+
+        # ── 6. Income summary per tenant/account holder ──────────────
+        # Fetch leases by unit OR by property (levy leases may have no unit)
+        leases = LeaseAgreement.objects.filter(
+            Q(unit_id__in=unit_id_list) | Q(property_id__in=property_id_list)
+        ).select_related('tenant', 'unit', 'unit__property', 'property')
+
+        lease_list = list(leases)
+
+        # Determine lookup key: (tenant_id, unit_id) for rental, (tenant_id, property_id) for levy without unit
+        def _lease_key(lease):
+            if lease.unit_id:
+                return ('unit', lease.tenant_id, lease.unit_id)
+            return ('property', lease.tenant_id, lease.property_id)
+
+        # Collect all tenant and unit/property IDs
+        tenant_ids = list({l.tenant_id for l in lease_list})
+        unit_ids = list({l.unit_id for l in lease_list if l.unit_id})
+        prop_ids_for_leases = list({l.property_id for l in lease_list if l.property_id and not l.unit_id})
+
+        valid_statuses = ['sent', 'partial', 'overdue', 'paid']
+
+        # ── Batch queries for unit-based leases ──
+        inv_currency_filter = Q()
+        rct_currency_filter = Q()
+        if currency:
+            inv_currency_filter = Q(currency=currency)
+            rct_currency_filter = Q(currency=currency)
+
+        # Prior invoices per (tenant, unit)
+        prior_inv_unit_qs = Invoice.objects.filter(
+            inv_currency_filter,
+            tenant_id__in=tenant_ids, unit_id__in=unit_ids,
+            date__lt=start_date, status__in=valid_statuses,
+        ).values('tenant_id', 'unit_id').annotate(total=Sum('total_amount'))
+        prior_inv_unit_map = {
+            ('unit', r['tenant_id'], r['unit_id']): r['total'] or Decimal('0')
+            for r in prior_inv_unit_qs
+        }
+
+        # Prior invoices per (tenant, property) for levy leases without unit
+        prior_inv_prop_qs = Invoice.objects.filter(
+            inv_currency_filter,
+            tenant_id__in=tenant_ids, property_id__in=prop_ids_for_leases,
+            unit__isnull=True,
+            date__lt=start_date, status__in=valid_statuses,
+        ).values('tenant_id', 'property_id').annotate(total=Sum('total_amount'))
+        prior_inv_prop_map = {
+            ('property', r['tenant_id'], r['property_id']): r['total'] or Decimal('0')
+            for r in prior_inv_prop_qs
+        }
+        prior_inv_map = {**prior_inv_unit_map, **prior_inv_prop_map}
+
+        # Prior payments per (tenant, unit)
+        prior_pay_unit_qs = Receipt.objects.filter(
+            rct_currency_filter,
+            tenant_id__in=tenant_ids, invoice__unit_id__in=unit_ids,
+            date__lt=start_date,
+        ).values('tenant_id', 'invoice__unit_id').annotate(total=Sum('amount'))
+        prior_pay_unit_map = {
+            ('unit', r['tenant_id'], r['invoice__unit_id']): r['total'] or Decimal('0')
+            for r in prior_pay_unit_qs
+        }
+
+        # Prior payments per (tenant, property) for levy leases without unit
+        prior_pay_prop_qs = Receipt.objects.filter(
+            rct_currency_filter,
+            tenant_id__in=tenant_ids, invoice__property_id__in=prop_ids_for_leases,
+            invoice__unit__isnull=True,
+            date__lt=start_date,
+        ).values('tenant_id', 'invoice__property_id').annotate(total=Sum('amount'))
+        prior_pay_prop_map = {
+            ('property', r['tenant_id'], r['invoice__property_id']): r['total'] or Decimal('0')
+            for r in prior_pay_prop_qs
+        }
+        prior_pay_map = {**prior_pay_unit_map, **prior_pay_prop_map}
+
+        # Period charges per (tenant, unit)
+        period_inv_unit_qs = Invoice.objects.filter(
+            inv_currency_filter,
+            tenant_id__in=tenant_ids, unit_id__in=unit_ids,
+            date__gte=start_date, date__lte=end_date, status__in=valid_statuses,
+        ).values('tenant_id', 'unit_id').annotate(total=Sum('total_amount'))
+        period_inv_unit_map = {
+            ('unit', r['tenant_id'], r['unit_id']): r['total'] or Decimal('0')
+            for r in period_inv_unit_qs
+        }
+
+        # Period charges per (tenant, property) for levy leases without unit
+        period_inv_prop_qs = Invoice.objects.filter(
+            inv_currency_filter,
+            tenant_id__in=tenant_ids, property_id__in=prop_ids_for_leases,
+            unit__isnull=True,
+            date__gte=start_date, date__lte=end_date, status__in=valid_statuses,
+        ).values('tenant_id', 'property_id').annotate(total=Sum('total_amount'))
+        period_inv_prop_map = {
+            ('property', r['tenant_id'], r['property_id']): r['total'] or Decimal('0')
+            for r in period_inv_prop_qs
+        }
+        period_inv_map = {**period_inv_unit_map, **period_inv_prop_map}
+
+        # Penalties per (tenant, unit)
+        penalty_unit_qs = Invoice.objects.filter(
+            inv_currency_filter,
+            tenant_id__in=tenant_ids, unit_id__in=unit_ids,
+            invoice_type='penalty',
+            date__gte=start_date, date__lte=end_date, status__in=valid_statuses,
+        ).values('tenant_id', 'unit_id').annotate(total=Sum('total_amount'))
+        penalty_unit_map = {
+            ('unit', r['tenant_id'], r['unit_id']): r['total'] or Decimal('0')
+            for r in penalty_unit_qs
+        }
+
+        # Penalties per (tenant, property)
+        penalty_prop_qs = Invoice.objects.filter(
+            inv_currency_filter,
+            tenant_id__in=tenant_ids, property_id__in=prop_ids_for_leases,
+            unit__isnull=True, invoice_type='penalty',
+            date__gte=start_date, date__lte=end_date, status__in=valid_statuses,
+        ).values('tenant_id', 'property_id').annotate(total=Sum('total_amount'))
+        penalty_prop_map = {
+            ('property', r['tenant_id'], r['property_id']): r['total'] or Decimal('0')
+            for r in penalty_prop_qs
+        }
+        penalty_map = {**penalty_unit_map, **penalty_prop_map}
+
+        # Build per-receipt lookup: key -> total paid in period
+        receipt_paid_map = {}
+        for r in period_receipts:
+            if r.invoice:
+                if r.invoice.unit_id:
+                    key = ('unit', r.tenant_id, r.invoice.unit_id)
+                elif r.invoice.property_id:
+                    key = ('property', r.tenant_id, r.invoice.property_id)
+                else:
+                    continue
+                receipt_paid_map[key] = receipt_paid_map.get(key, Decimal('0')) + r.amount
+
+        income_summary_tenants = []
+        totals_bf = Decimal('0')
+        totals_charge = Decimal('0')
+        totals_paid = Decimal('0')
+        totals_penalty = Decimal('0')
+        seen_lease_keys = set()
+
+        for lease in lease_list:
+            lkey = _lease_key(lease)
+            if lkey in seen_lease_keys:
+                continue
+            seen_lease_keys.add(lkey)
+
+            tenant = lease.tenant
+            unit = lease.unit
+
+            prior_invoices_total = prior_inv_map.get(lkey, Decimal('0'))
+            prior_payments = prior_pay_map.get(lkey, Decimal('0'))
+            balance_bf = prior_invoices_total - prior_payments
+
+            period_charges = period_inv_map.get(lkey, Decimal('0'))
+            penalty = penalty_map.get(lkey, Decimal('0'))
+            charge = period_charges - penalty
+
+            amount_due = balance_bf + charge + penalty
+            amount_paid = receipt_paid_map.get(lkey, Decimal('0'))
+            carried_forward = amount_due - amount_paid
+
+            if unit:
+                prop_name = unit.property.name if unit.property else ''
+                display_name = f"{tenant.name} {unit.unit_number} {prop_name}".strip()
+                unit_label = unit.unit_number
+            else:
+                prop_obj = lease.property
+                prop_name = prop_obj.name if prop_obj else ''
+                display_name = f"{tenant.name} {prop_name}".strip()
+                unit_label = ''
+
+            income_summary_tenants.append({
+                'tenant_id': lease.tenant_id,
+                'account_holder_id': lease.tenant_id,
+                'account_holder': display_name,
+                'name': display_name,
+                'unit': unit_label,
+                'balance_bf': float(balance_bf),
+                'charge': float(charge),
+                'amount_due': float(amount_due),
+                'amount_paid': float(amount_paid),
+                'penalty': float(penalty),
+                'carried_forward': float(carried_forward),
+            })
+
+            totals_bf += balance_bf
+            totals_charge += charge
+            totals_paid += amount_paid
+            totals_penalty += penalty
+
+        income_summary = {
+            'as_of': str(end_date),
+            'tenants': income_summary_tenants,
+            'totals': {
+                'balance_bf': float(totals_bf),
+                'charge': float(totals_charge),
+                'amount_due': float(totals_bf + totals_charge + totals_penalty),
+                'amount_paid': float(totals_paid),
+                'penalty': float(totals_penalty),
+                'carried_forward': float(totals_bf + totals_charge + totals_penalty - totals_paid),
+            },
+        }
+
+        # ── 7. Working Capital ───────────────────────────────────────
+        cash_balance = float(running_balance)
+        levies_in_arrears = sum(
+            t['carried_forward'] for t in income_summary_tenants if t['carried_forward'] > 0
+        )
+        prepayments = sum(
+            abs(t['carried_forward']) for t in income_summary_tenants if t['carried_forward'] < 0
+        )
+        overdraft = abs(cash_balance) if cash_balance < 0 else 0.0
+
+        total_debtors = (cash_balance if cash_balance > 0 else 0.0) + levies_in_arrears
+        total_creditors = overdraft + prepayments
+
+        working_capital = {
+            'as_of': str(end_date),
+            'debtors': {
+                'cash_balances': cash_balance if cash_balance > 0 else 0.0,
+                'levies_in_arrears': levies_in_arrears,
+                'arrears': levies_in_arrears,
+                'total': total_debtors,
+                'subtotal': total_debtors,
+            },
+            'creditors': {
+                'overdraft': overdraft,
+                'prepayments': prepayments,
+                'total': total_creditors,
+                'subtotal': total_creditors,
+            },
+            'net_working_capital': total_debtors - total_creditors,
+        }
+
+        # ── 8. income_items / expense_items for LandlordDetail chart ─
+        income_items = [
+            {'name': self.INVOICE_TYPE_LABELS.get(cat['key'], cat['key']),
+             'category': cat['key'],
+             'amount': con_income_by_cat.get(cat['key'], 0.0),
+             'total': con_income_by_cat.get(cat['key'], 0.0)}
+            for cat in income_category_labels
+        ]
+        expense_items = [
+            {'name': cat['label'], 'category': cat['key'],
+             'amount': con_exp_by_type.get(cat['key'], 0.0),
+             'total': con_exp_by_type.get(cat['key'], 0.0)}
+            for cat in expense_category_labels
+        ]
+        # Always include commission as an expense item
+        expense_items.append({
+            'name': f"Management Commission {commission_rate}% (Inc VAT)",
+            'category': 'management_commission',
+            'amount': con_commission,
+            'total': con_commission,
+        })
+
+        # ── Response ─────────────────────────────────────────────────
+        return Response({
+            'report_name': 'Income & Expenditure Report',
+            'entity': {
+                'type': entity_type,
+                'id': int(landlord_id or property_id),
+                'name': entity_name,
+            },
+            'properties': property_names,
+            'management_type': 'levy' if is_levy else 'rental',
+            'period': {
+                'start': str(start_date),
+                'end': str(end_date),
+            },
+            'currency': currency or 'USD',
+            'commission_rate': commission_rate,
+            'income_category_labels': income_category_labels,
+            'expense_category_labels': expense_category_labels,
+            'months': months,
+            'consolidated': consolidated,
+            'income_summary': income_summary,
+            'working_capital': working_capital,
+            # Flat totals for LandlordDetail chart compatibility
+            'total_income': con_levies,
+            'total_expenses': con_total_exp,
+            'income_items': income_items,
+            'expense_items': expense_items,
+        })
+
+
+class DataVisualizationView(APIView):
+    """
+    Data Visualization Endpoints - Aggregated data for charts and graphs.
+    Provides data for:
+    - Tenant payment trends (pie charts)
+    - Property occupancy timeline
+    - Revenue trends
+    - Collection rates over time
+    """
+    permission_classes = [IsAuthenticated]
+
+    @_cache_report('charts', ttl=300)
+    def get(self, request):
+        chart_type = request.query_params.get('chart_type')
+
+        if chart_type == 'tenant_payments':
+            return self._tenant_payment_chart(request)
+        elif chart_type == 'occupancy_timeline':
+            return self._occupancy_timeline(request)
+        elif chart_type == 'revenue_trend':
+            return self._revenue_trend(request)
+        elif chart_type == 'collection_rates':
+            return self._collection_rates(request)
+        elif chart_type == 'income_distribution':
+            return self._income_distribution(request)
+        else:
+            return Response({
+                'available_charts': [
+                    'tenant_payments', 'occupancy_timeline', 'revenue_trend',
+                    'collection_rates', 'income_distribution'
+                ]
+            })
+
+    def _tenant_payment_chart(self, request):
+        """Tenant payment analysis - pie chart data."""
+        tenant_id = request.query_params.get('tenant_id')
+
+        if tenant_id:
+            receipts = Receipt.objects.filter(tenant_id=tenant_id)
+        else:
+            receipts = Receipt.objects.all()
+
+        # Payment methods distribution
+        by_method = receipts.values('payment_method').annotate(
+            total=Sum('amount'),
+            count=Count('id')
+        )
+
+        return Response({
+            'chart_type': 'tenant_payments',
+            'pie_chart': {
+                'labels': [dict(Receipt.PaymentMethod.choices).get(m['payment_method'], m['payment_method']) for m in by_method],
+                'values': [float(m['total'] or 0) for m in by_method],
+                'counts': [m['count'] for m in by_method]
+            }
+        })
+
+    def _occupancy_timeline(self, request):
+        """Property occupancy over time - timeline chart. Single query approach."""
+        property_id = request.query_params.get('property_id')
+        months = int(request.query_params.get('months', 12))
+
+        today = timezone.now().date()
+        start_date = today - timedelta(days=months * 30)
+
+        # Get total units once
+        if property_id:
+            total_units = Unit.objects.filter(property_id=property_id).count()
+        else:
+            total_units = Unit.objects.count()
+
+        # Get all relevant leases in one query
+        lease_qs = LeaseAgreement.objects.filter(
+            start_date__lte=today,
+            status__in=['active', 'expired']
+        )
+        if property_id:
+            lease_qs = lease_qs.filter(unit__property_id=property_id)
+
+        leases = list(lease_qs.values_list('start_date', 'end_date', 'status'))
+
+        # Build monthly occupancy by iterating in Python (avoids N queries)
+        timeline = []
+        current_date = start_date.replace(day=1)
+        while current_date <= today:
+            month_end = (current_date + timedelta(days=32)).replace(day=1) - timedelta(days=1)
+            active_count = sum(
+                1 for start, end, st in leases
+                if start <= month_end and (end >= current_date or st == 'active')
+            )
+            occupancy_rate = (active_count / total_units * 100) if total_units else 0
+            timeline.append({
+                'month': current_date.strftime('%Y-%m'),
+                'active_leases': active_count,
+                'total_units': total_units,
+                'occupancy_rate': round(occupancy_rate, 1)
+            })
+            current_date = (current_date + timedelta(days=32)).replace(day=1)
+
+        return Response({
+            'chart_type': 'occupancy_timeline',
+            'timeline': timeline,
+            'line_chart': {
+                'labels': [t['month'] for t in timeline],
+                'occupancy_rates': [t['occupancy_rate'] for t in timeline]
+            }
+        })
+
+    def _revenue_trend(self, request):
+        """Revenue trend over time - bar/line chart."""
+        months = int(request.query_params.get('months', 12))
+
+        # Monthly revenue from receipts
+        receipts = Receipt.objects.filter(
+            date__gte=timezone.now().date() - timedelta(days=months * 30)
+        ).annotate(
+            month=TruncMonth('date')
+        ).values('month').annotate(
+            total=Sum('amount')
+        ).order_by('month')
+
+        # Monthly invoiced from invoices
+        invoices = Invoice.objects.filter(
+            date__gte=timezone.now().date() - timedelta(days=months * 30)
+        ).annotate(
+            month=TruncMonth('date')
+        ).values('month').annotate(
+            total=Sum('total_amount')
+        ).order_by('month')
+
+        # Merge data
+        revenue_data = {r['month'].strftime('%Y-%m'): float(r['total'] or 0) for r in receipts}
+        invoice_data = {i['month'].strftime('%Y-%m'): float(i['total'] or 0) for i in invoices}
+
+        all_months = sorted(set(revenue_data.keys()) | set(invoice_data.keys()))
+
+        return Response({
+            'chart_type': 'revenue_trend',
+            'bar_chart': {
+                'labels': all_months,
+                'invoiced': [invoice_data.get(m, 0) for m in all_months],
+                'collected': [revenue_data.get(m, 0) for m in all_months]
+            }
+        })
+
+    def _collection_rates(self, request):
+        """Collection rates over time."""
+        months = int(request.query_params.get('months', 12))
+
+        # Get monthly totals
+        today = timezone.now().date()
+        start_date = today - timedelta(days=months * 30)
+
+        invoices = Invoice.objects.filter(date__gte=start_date).annotate(
+            month=TruncMonth('date')
+        ).values('month').annotate(
+            invoiced=Sum('total_amount'),
+            collected=Sum('amount_paid')
+        ).order_by('month')
+
+        rates = []
+        for inv in invoices:
+            invoiced = float(inv['invoiced'] or 0)
+            collected = float(inv['collected'] or 0)
+            rate = (collected / invoiced * 100) if invoiced else 0
+            rates.append({
+                'month': inv['month'].strftime('%Y-%m'),
+                'invoiced': invoiced,
+                'collected': collected,
+                'rate': round(rate, 1)
+            })
+
+        return Response({
+            'chart_type': 'collection_rates',
+            'data': rates,
+            'line_chart': {
+                'labels': [r['month'] for r in rates],
+                'rates': [r['rate'] for r in rates]
+            }
+        })
+
+    def _income_distribution(self, request):
+        """Income distribution by type - pie chart."""
+        start_date = request.query_params.get('start_date')
+        end_date = request.query_params.get('end_date', timezone.now().date())
+
+        receipts = Receipt.objects.filter(date__lte=end_date)
+        if start_date:
+            receipts = receipts.filter(date__gte=start_date)
+
+        by_type = receipts.values('invoice__invoice_type').annotate(
+            total=Sum('amount')
+        )
+
+        labels = []
+        values = []
+        for item in by_type:
+            inv_type = item['invoice__invoice_type']
+            if inv_type:
+                labels.append(dict(Invoice.InvoiceType.choices).get(inv_type, inv_type))
+                values.append(float(item['total'] or 0))
+
+        return Response({
+            'chart_type': 'income_distribution',
+            'pie_chart': {
+                'labels': labels,
+                'values': values
+            }
+        })
+
+
+class StreamingCSVExportView(APIView):
+    """
+    Server-side streaming CSV export for large datasets.
+    Avoids loading all data into browser memory.
+    Supports: invoices, receipts, tenants, properties, leases, expenses
+    """
+    permission_classes = [IsAuthenticated]
+
+    EXPORT_CONFIGS = {
+        'invoices': {
+            'model': Invoice,
+            'select_related': ['tenant', 'unit', 'unit__property', 'lease'],
+            'fields': [
+                ('invoice_number', 'Invoice Number'),
+                ('tenant__name', 'Tenant'),
+                ('unit__unit_number', 'Unit'),
+                ('unit__property__name', 'Property'),
+                ('invoice_type', 'Type'),
+                ('status', 'Status'),
+                ('date', 'Date'),
+                ('due_date', 'Due Date'),
+                ('amount', 'Amount'),
+                ('vat_amount', 'VAT'),
+                ('total_amount', 'Total'),
+                ('amount_paid', 'Paid'),
+                ('balance', 'Balance'),
+                ('currency', 'Currency'),
+                ('description', 'Description'),
+            ],
+        },
+        'receipts': {
+            'model': Receipt,
+            'select_related': ['tenant', 'invoice'],
+            'fields': [
+                ('receipt_number', 'Receipt Number'),
+                ('tenant__name', 'Tenant'),
+                ('invoice__invoice_number', 'Invoice'),
+                ('date', 'Date'),
+                ('amount', 'Amount'),
+                ('currency', 'Currency'),
+                ('payment_method', 'Payment Method'),
+                ('reference', 'Reference'),
+                ('description', 'Description'),
+            ],
+        },
+        'tenants': {
+            'model': RentalTenant,
+            'select_related': [],
+            'fields': [
+                ('code', 'Code'),
+                ('name', 'Name'),
+                ('email', 'Email'),
+                ('phone', 'Phone'),
+                ('id_number', 'ID Number'),
+                ('account_type', 'Account Type'),
+                ('is_active', 'Active'),
+            ],
+        },
+        'properties': {
+            'model': Property,
+            'select_related': ['landlord'],
+            'fields': [
+                ('code', 'Code'),
+                ('name', 'Name'),
+                ('landlord__name', 'Landlord'),
+                ('address', 'Address'),
+                ('city', 'City'),
+                ('property_type', 'Type'),
+            ],
+        },
+        'leases': {
+            'model': LeaseAgreement,
+            'select_related': ['tenant', 'unit', 'unit__property'],
+            'fields': [
+                ('lease_number', 'Lease Number'),
+                ('tenant__name', 'Tenant'),
+                ('unit__unit_number', 'Unit'),
+                ('unit__property__name', 'Property'),
+                ('monthly_rent', 'Monthly Rent'),
+                ('currency', 'Currency'),
+                ('start_date', 'Start Date'),
+                ('end_date', 'End Date'),
+                ('status', 'Status'),
+            ],
+        },
+        'expenses': {
+            'model': Expense,
+            'select_related': [],
+            'fields': [
+                ('expense_number', 'Expense Number'),
+                ('expense_type', 'Type'),
+                ('payee_name', 'Payee'),
+                ('date', 'Date'),
+                ('amount', 'Amount'),
+                ('currency', 'Currency'),
+                ('status', 'Status'),
+                ('description', 'Description'),
+            ],
+        },
+    }
+
+    def get(self, request):
+        export_type = request.query_params.get('type')
+        if export_type not in self.EXPORT_CONFIGS:
+            return Response(
+                {'error': f'Invalid export type. Available: {", ".join(self.EXPORT_CONFIGS.keys())}'},
+                status=400
+            )
+
+        config = self.EXPORT_CONFIGS[export_type]
+        model = config['model']
+        queryset = model.objects.all()
+        if config['select_related']:
+            queryset = queryset.select_related(*config['select_related'])
+
+        # Apply basic filters from query params
+        for key, value in request.query_params.items():
+            if key in ('type', 'format'):
+                continue
+            if hasattr(model, key) or '__' in key:
+                try:
+                    queryset = queryset.filter(**{key: value})
+                except Exception:
+                    pass
+
+        # Stream CSV response
+        import csv
+
+        class Echo:
+            """Pseudo-buffer that returns everything written to it."""
+            def write(self, value):
+                return value
+
+        def csv_rows():
+            pseudo_buffer = Echo()
+            writer = csv.writer(pseudo_buffer)
+            # Header row
+            yield writer.writerow([f[1] for f in config['fields']])
+            # Data rows — iterate in chunks of 2000
+            for obj in queryset.iterator(chunk_size=2000):
+                row = []
+                for field_path, _ in config['fields']:
+                    value = obj
+                    for part in field_path.split('__'):
+                        value = getattr(value, part, '') if value else ''
+                    row.append(str(value) if value is not None else '')
+                yield writer.writerow(row)
+
+        from django.http import StreamingHttpResponse
+
+        response = StreamingHttpResponse(csv_rows(), content_type='text/csv')
+        timestamp = timezone.now().strftime('%Y%m%d')
+        response['Content-Disposition'] = f'attachment; filename="{export_type}_{timestamp}.csv"'
+        return response
+
+
+class ReceiptListingReportView(APIView):
+    """
+    Receipt Listing Report – comprehensive receipt listing with grouping
+    by income type and bank account.
+
+    Parameters: period_start, period_end, landlord_id, bank_account,
+                income_type, currency
+    """
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        period_start = request.query_params.get('period_start')
+        period_end = request.query_params.get('period_end', str(timezone.now().date()))
+        landlord_id = request.query_params.get('landlord_id')
+        bank_account = request.query_params.get('bank_account')
+        income_type = request.query_params.get('income_type')
+        currency = request.query_params.get('currency')
+
+        receipts = Receipt.objects.select_related(
+            'tenant', 'invoice', 'invoice__unit', 'invoice__unit__property',
+            'invoice__unit__property__landlord', 'bank_account',
+        ).filter(date__lte=period_end)
+
+        if period_start:
+            receipts = receipts.filter(date__gte=period_start)
+        if landlord_id:
+            receipts = receipts.filter(
+                invoice__unit__property__landlord_id=landlord_id
+            )
+        if bank_account:
+            receipts = receipts.filter(bank_account_id=bank_account)
+        if income_type:
+            receipts = receipts.filter(invoice__invoice_type=income_type)
+        if currency:
+            receipts = receipts.filter(currency=currency)
+
+        receipts = receipts.order_by('-date', '-created_at')
+
+        receipt_list = []
+        total_amount = Decimal('0')
+        totals_by_income_type = {}
+        totals_by_bank = {}
+
+        for rcpt in receipts:
+            landlord_name = None
+            landlord_id_val = None
+            property_name = None
+            property_id_val = None
+            income_type_name = None
+
+            if rcpt.invoice and rcpt.invoice.unit:
+                unit = rcpt.invoice.unit
+                prop = unit.property
+                landlord = prop.landlord
+                landlord_name = landlord.name
+                landlord_id_val = landlord.id
+                property_name = prop.name
+                property_id_val = prop.id
+                income_type_name = rcpt.invoice.get_invoice_type_display()
+
+            bank_name = rcpt.bank_account.name if rcpt.bank_account else rcpt.bank_name
+
+            receipt_list.append({
+                'date': str(rcpt.date),
+                'transaction_id': rcpt.receipt_number,
+                'income_type_name': income_type_name,
+                'tenant_name': rcpt.tenant.name if rcpt.tenant else None,
+                'tenant_id': rcpt.tenant_id,
+                'landlord_name': landlord_name,
+                'landlord_id': landlord_id_val,
+                'property_name': property_name,
+                'property_id': property_id_val,
+                'bank_reference': rcpt.reference,
+                'currency': rcpt.currency,
+                'amount': float(rcpt.amount),
+                'payment_method': rcpt.get_payment_method_display(),
+            })
+
+            total_amount += rcpt.amount
+
+            # Aggregate by income type
+            type_key = income_type_name or 'Other'
+            if type_key not in totals_by_income_type:
+                totals_by_income_type[type_key] = Decimal('0')
+            totals_by_income_type[type_key] += rcpt.amount
+
+            # Aggregate by bank account
+            bank_key = bank_name or 'Unknown'
+            if bank_key not in totals_by_bank:
+                totals_by_bank[bank_key] = Decimal('0')
+            totals_by_bank[bank_key] += rcpt.amount
+
+        return Response({
+            'period': {'start': period_start, 'end': period_end},
+            'receipts': receipt_list,
+            'by_income_type': [
+                {'name': k, 'total': float(v)}
+                for k, v in totals_by_income_type.items()
+            ],
+            'by_bank_account': [
+                {'name': k, 'total': float(v)}
+                for k, v in totals_by_bank.items()
+            ],
+            'total': float(total_amount),
+        })
+
+
+class CommissionAnalysisReportView(APIView):
+    """
+    Commission Analysis Report – commission earned breakdown by income type
+    and by property.
+
+    Parameters: period_start, period_end, landlord_id, currency
+    """
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        period_start = request.query_params.get('period_start')
+        period_end = request.query_params.get('period_end', str(timezone.now().date()))
+        landlord_id = request.query_params.get('landlord_id')
+        currency = request.query_params.get('currency')
+
+        receipts = Receipt.objects.filter(
+            date__lte=period_end
+        ).select_related(
+            'invoice', 'invoice__unit', 'invoice__unit__property',
+            'invoice__unit__property__landlord', 'income_type',
+        )
+
+        if period_start:
+            receipts = receipts.filter(date__gte=period_start)
+        if landlord_id:
+            receipts = receipts.filter(
+                invoice__unit__property__landlord_id=landlord_id
+            )
+        if currency:
+            receipts = receipts.filter(currency=currency)
+
+        by_income_type = {}
+        by_property = {}
+        total_receipts = Decimal('0')
+        total_commission = Decimal('0')
+
+        for rcpt in receipts:
+            if not rcpt.invoice or not rcpt.invoice.unit:
+                continue
+
+            prop = rcpt.invoice.unit.property
+            commission_rate = _resolve_commission_rate_pct(rcpt.income_type, prop.id) / 100
+            commission = rcpt.amount * commission_rate
+            inv_type = rcpt.invoice.get_invoice_type_display()
+
+            # By income type
+            if inv_type not in by_income_type:
+                by_income_type[inv_type] = {
+                    'total_receipts': Decimal('0'),
+                    'commission': Decimal('0'),
+                }
+            by_income_type[inv_type]['total_receipts'] += rcpt.amount
+            by_income_type[inv_type]['commission'] += commission
+
+            # By property
+            if prop.id not in by_property:
+                by_property[prop.id] = {
+                    'property': prop.name,
+                    'property_id': prop.id,
+                    'total_receipts': Decimal('0'),
+                    'commission': Decimal('0'),
+                }
+            by_property[prop.id]['total_receipts'] += rcpt.amount
+            by_property[prop.id]['commission'] += commission
+
+            total_receipts += rcpt.amount
+            total_commission += commission
+
+        income_type_data = [
+            {
+                'income_type': k,
+                'total_receipts': float(v['total_receipts']),
+                'commission': float(v['commission']),
+                'percentage': round(
+                    float(v['commission']) / float(total_commission) * 100, 1
+                ) if total_commission else 0,
+            }
+            for k, v in by_income_type.items()
+        ]
+        income_type_data.sort(key=lambda x: x['commission'], reverse=True)
+
+        property_data = [
+            {
+                'property': v['property'],
+                'property_id': v['property_id'],
+                'total_receipts': float(v['total_receipts']),
+                'commission': float(v['commission']),
+                'percentage': round(
+                    float(v['commission']) / float(total_commission) * 100, 1
+                ) if total_commission else 0,
+            }
+            for v in by_property.values()
+        ]
+        property_data.sort(key=lambda x: x['commission'], reverse=True)
+
+        return Response({
+            'period': {'start': period_start, 'end': period_end},
+            'by_income_type': income_type_data,
+            'by_property': property_data,
+            'total_receipts': float(total_receipts),
+            'total_commission': float(total_commission),
+        })
+
+
+class IncomeItemAnalysisReportView(APIView):
+    """
+    Income Item Analysis Report – total income per income type and breakdown
+    by bank account.
+
+    Parameters: period_start, period_end, landlord_id, bank_account, currency
+    """
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        period_start = request.query_params.get('period_start')
+        period_end = request.query_params.get('period_end', str(timezone.now().date()))
+        landlord_id = request.query_params.get('landlord_id')
+        bank_account = request.query_params.get('bank_account')
+        currency = request.query_params.get('currency')
+
+        receipts = Receipt.objects.filter(date__lte=period_end).select_related(
+            'invoice', 'invoice__unit', 'invoice__unit__property',
+            'invoice__unit__property__landlord', 'bank_account',
+        )
+
+        if period_start:
+            receipts = receipts.filter(date__gte=period_start)
+        if landlord_id:
+            receipts = receipts.filter(
+                invoice__unit__property__landlord_id=landlord_id
+            )
+        if bank_account:
+            receipts = receipts.filter(bank_account_id=bank_account)
+        if currency:
+            receipts = receipts.filter(currency=currency)
+
+        totals_by_type = {}
+        by_bank_and_income = {}
+        grand_total = Decimal('0')
+
+        for rcpt in receipts:
+            inv_type = rcpt.invoice.get_invoice_type_display() if rcpt.invoice else 'Other'
+            bank_name = rcpt.bank_account.name if rcpt.bank_account else (rcpt.bank_name or 'Cash')
+
+            # By income type
+            if inv_type not in totals_by_type:
+                totals_by_type[inv_type] = Decimal('0')
+            totals_by_type[inv_type] += rcpt.amount
+
+            # By bank + income type
+            combo_key = (bank_name, inv_type)
+            if combo_key not in by_bank_and_income:
+                by_bank_and_income[combo_key] = Decimal('0')
+            by_bank_and_income[combo_key] += rcpt.amount
+
+            grand_total += rcpt.amount
+
+        income_type_data = [
+            {
+                'income_type': k,
+                'total': float(v),
+                'percentage': round(float(v) / float(grand_total) * 100, 1) if grand_total else 0,
+            }
+            for k, v in totals_by_type.items()
+        ]
+        income_type_data.sort(key=lambda x: x['total'], reverse=True)
+
+        bank_income_data = [
+            {
+                'bank': k[0],
+                'income_type': k[1],
+                'total': float(v),
+            }
+            for k, v in by_bank_and_income.items()
+        ]
+        bank_income_data.sort(key=lambda x: x['total'], reverse=True)
+
+        return Response({
+            'period': {'start': period_start, 'end': period_end},
+            'by_income_type': income_type_data,
+            'by_bank_and_income': bank_income_data,
+            'total': float(grand_total),
+        })

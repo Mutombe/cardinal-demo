@@ -1,0 +1,1308 @@
+"""
+Billing models for Invoices and Receipts.
+Implements Trust Accounting Activities:
+  1. Billing/Invoicing - Tenant charge (Dr Tenant Acc, Cr Unpaid Rent)
+  2. Receipting - Payment received (Dr Cash, Cr Tenant Acc)
+  3. Transfer to Landlord - (Dr Unpaid Rent, Cr Landlord Trust Payable)
+  4. Commission Allocation - (Dr Landlord Trust Payable, Cr Commission Revenue, Cr VAT)
+  5. Expense Posting - Manual (Dr Expense, Cr Cash/Bank)
+"""
+from decimal import Decimal, ROUND_HALF_UP
+from django.db import models, transaction
+from django.conf import settings
+from apps.masterfile.models import RentalTenant, Unit, LeaseAgreement, Property
+from apps.accounting.models import (
+    Journal, JournalEntry, ChartOfAccount, AuditTrail,
+    SubsidiaryAccount, SubsidiaryTransaction, build_transaction_description,
+)
+from apps.soft_delete import SoftDeleteModel
+
+
+class Invoice(SoftDeleteModel):
+    """
+    Rent Invoice - Activity 1: Debt Recognition.
+    Creates: Dr Accounts Receivable, Cr Rental Income
+    """
+
+    class Status(models.TextChoices):
+        DRAFT = 'draft', 'Draft'
+        SENT = 'sent', 'Sent'
+        PARTIAL = 'partial', 'Partially Paid'
+        PAID = 'paid', 'Paid'
+        OVERDUE = 'overdue', 'Overdue'
+        CANCELLED = 'cancelled', 'Cancelled'
+
+    class InvoiceType(models.TextChoices):
+        # Rental income types
+        RENT = 'rent', 'Rent'
+        DEPOSIT = 'deposit', 'Deposit'
+        # Levy income types (for residential associations)
+        LEVY = 'levy', 'Levy'
+        SPECIAL_LEVY = 'special_levy', 'Special Levy'
+        RATES = 'rates', 'Rates'
+        PARKING = 'parking', 'Parking'
+        # Penalty
+        PENALTY = 'penalty', 'Late Payment Penalty'
+        # Other types
+        UTILITY = 'utility', 'Utility'
+        MAINTENANCE = 'maintenance', 'Maintenance'
+        VAT = 'vat', 'VAT'
+        OTHER = 'other', 'Other'
+
+    invoice_number = models.CharField(max_length=50, unique=True)
+    tenant = models.ForeignKey(
+        RentalTenant, on_delete=models.PROTECT, related_name='invoices'
+    )
+    lease = models.ForeignKey(
+        LeaseAgreement, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='invoices'
+    )
+    unit = models.ForeignKey(
+        Unit, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='invoices'
+    )
+    # Property reference for easier filtering and reporting
+    property = models.ForeignKey(
+        Property, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='invoices'
+    )
+    # Income type for detailed income analysis
+    income_type = models.ForeignKey(
+        'accounting.IncomeType', on_delete=models.SET_NULL,
+        null=True, blank=True, related_name='invoices'
+    )
+
+    invoice_type = models.CharField(
+        max_length=20,
+        choices=InvoiceType.choices,
+        default=InvoiceType.RENT
+    )
+    status = models.CharField(
+        max_length=20,
+        choices=Status.choices,
+        default=Status.DRAFT
+    )
+
+    # Dates
+    date = models.DateField()
+    due_date = models.DateField()
+    period_start = models.DateField(null=True, blank=True)
+    period_end = models.DateField(null=True, blank=True)
+
+    # Amounts
+    amount = models.DecimalField(max_digits=18, decimal_places=2)
+    vat_amount = models.DecimalField(max_digits=18, decimal_places=2, default=Decimal('0'))
+    total_amount = models.DecimalField(max_digits=18, decimal_places=2)
+    amount_paid = models.DecimalField(max_digits=18, decimal_places=2, default=Decimal('0'))
+    balance = models.DecimalField(max_digits=18, decimal_places=2)
+    currency = models.CharField(max_length=3, default='USD')
+
+    description = models.TextField(blank=True)
+    notes = models.TextField(blank=True)
+
+    # GL Reference
+    journal = models.ForeignKey(
+        Journal, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='invoices'
+    )
+
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True,
+        related_name='created_invoices'
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = 'Invoice'
+        verbose_name_plural = 'Invoices'
+        ordering = ['-date', '-created_at']
+        indexes = [
+            models.Index(fields=['status', 'due_date']),
+            models.Index(fields=['lease', 'period_start']),
+            models.Index(fields=['tenant']),
+            models.Index(fields=['invoice_type']),
+            models.Index(fields=['date']),
+            models.Index(fields=['currency']),
+            models.Index(fields=['property']),
+            models.Index(fields=['status', 'balance']),
+            models.Index(fields=['tenant', 'date']),
+            models.Index(fields=['unit', 'date']),
+        ]
+
+    def __str__(self):
+        return f'{self.invoice_number} - {self.tenant.name}'
+
+    def save(self, *args, **kwargs):
+        # Auto-populate property from unit
+        if self.unit and not self.property:
+            self.property = self.unit.property
+
+        # Calculate totals
+        self.total_amount = self.amount + self.vat_amount
+        self.balance = self.total_amount - self.amount_paid
+
+        if not self.invoice_number:
+            with transaction.atomic():
+                self.invoice_number = self.generate_invoice_number()
+                super().save(*args, **kwargs)
+                return
+
+        super().save(*args, **kwargs)
+
+    @classmethod
+    def generate_invoice_number(cls):
+        from django.utils import timezone
+        prefix = timezone.now().strftime('INV%Y%m%d')
+        last = cls.all_objects.select_for_update().filter(invoice_number__startswith=prefix).order_by('-invoice_number').first()
+        if last:
+            num = int(last.invoice_number[len(prefix):]) + 1
+        else:
+            num = 1
+        return f'{prefix}{num:04d}'
+
+    def _get_billing_contra_code(self):
+        """Get the billing/invoicing expense code for this invoice type."""
+        type_map = {
+            'rent': '2300/010', 'levy': '2300/020', 'parking': '2300/030',
+            'maintenance': '2300/040', 'special_levy': '2300/050',
+            'rates': '2300/060', 'vat': '2300/070', 'penalty': '2300/080',
+        }
+        return type_map.get(self.invoice_type, '2300/010')
+
+    def _get_income_contra_code(self):
+        """Get the income account code for this invoice type."""
+        type_map = {
+            'rent': '1000/010', 'levy': '1000/020', 'parking': '1000/030',
+            'maintenance': '1000/040', 'special_levy': '1000/050',
+            'rates': '1000/060', 'vat': '1000/080',
+        }
+        return type_map.get(self.invoice_type, '1000/010')
+
+    def _get_unpaid_contra_code(self):
+        """Get the unpaid/deferred liability code for this invoice type."""
+        type_map = {
+            'rent': '6000/010', 'levy': '6000/020', 'parking': '6000/030',
+            'special_levy': '6000/040', 'maintenance': '6000/050',
+            'rates': '6000/060', 'vat': '6000/070',
+        }
+        return type_map.get(self.invoice_type, '6000/010')
+
+    def _get_commission_expense_code(self):
+        """Get the commission expense code for this invoice type."""
+        type_map = {
+            'rent': '2000/010', 'levy': '2000/020', 'parking': '2000/030',
+            'maintenance': '2000/040', 'special_levy': '2000/050',
+            'rates': '2000/060',
+        }
+        return type_map.get(self.invoice_type, '2000/010')
+
+    @transaction.atomic
+    def post_to_ledger(self, user=None):
+        """
+        Post invoice to General Ledger — Activity 1: Billing/Invoicing.
+
+        GL entries (agent's books):
+            Dr: Accounts Receivable (1200) — control account for tenant sub-ledgers
+            Cr: Unpaid Rent (2200) — deferred revenue until payment
+
+        Subsidiary entries (per-entity view):
+            Txn 1: Dr Tenant Account (TN/xxx), contra: billing code (e.g., 2300/010)
+            Txn 2: Cr Unpaid Rent Account, contra: tenant code (TN/xxx)
+
+        Revenue is NOT recognized here. Revenue recognition happens
+        when payment is received (Activity 3).
+        """
+        if self.journal:
+            return self.journal
+
+        # Get or create Unpaid Rent account (deferred revenue)
+        unpaid_rent_account, _ = ChartOfAccount.objects.get_or_create(
+            code='2200',
+            defaults={
+                'name': 'Unpaid Rent (Deferred Revenue)',
+                'account_type': 'liability',
+                'account_subtype': 'tenant_deposits',
+                'is_system': True
+            }
+        )
+
+        ar_account, _ = ChartOfAccount.objects.get_or_create(
+            code='1200',
+            defaults={
+                'name': 'Accounts Receivable',
+                'account_type': 'asset',
+                'account_subtype': 'accounts_receivable',
+                'is_system': True,
+            },
+        )
+
+        # Build description in trust accounting format
+        invoice_type_label = self.get_invoice_type_display()
+        lease_ref = f'Lease ID {self.lease_id}' if self.lease_id else ''
+        unit_label = f'{self.unit.property.name}-{self.unit.unit_number}' if self.unit else ''
+        period = self.date.strftime('%b')
+        desc = f'{period} {invoice_type_label} Charge'
+        if lease_ref:
+            desc += f'- {lease_ref}'
+
+        # Create journal
+        journal = Journal.objects.create(
+            journal_type=Journal.JournalType.SALES,
+            date=self.date,
+            description=f'Invoice {self.invoice_number} - {self.tenant.name}',
+            reference=self.invoice_number,
+            currency=self.currency,
+            created_by=user
+        )
+
+        # GL Entry 1: Dr Accounts Receivable (control account)
+        je_debit = JournalEntry.objects.create(
+            journal=journal,
+            account=ar_account,
+            description=desc,
+            debit_amount=self.total_amount,
+            source_type='invoice',
+            source_id=self.id
+        )
+
+        # GL Entry 2: Cr Unpaid Rent (deferred revenue)
+        je_credit = JournalEntry.objects.create(
+            journal=journal,
+            account=unpaid_rent_account,
+            description=desc,
+            credit_amount=self.total_amount,
+            source_type='invoice',
+            source_id=self.id
+        )
+
+        journal.post(user)
+
+        # === Subsidiary Ledger Entries ===
+        # Txn 1: Debit tenant's subsidiary account
+        tenant_sub = SubsidiaryAccount.get_or_create_for_tenant(self.tenant)
+        SubsidiaryTransaction.create_entry(
+            account=tenant_sub,
+            date=self.date,
+            contra_account=self._get_billing_contra_code(),
+            reference=self.invoice_number,
+            description=desc,
+            debit_amount=self.total_amount,
+            journal_entry=je_debit,
+        )
+
+        # Txn 2: Credit unpaid rent (tracked per invoice for auditing)
+        # This mirrors the GL credit to the Unpaid Rent control account
+
+        self.journal = journal
+        self.status = self.Status.SENT
+        self.save()
+
+        return journal
+
+
+class Receipt(SoftDeleteModel):
+    """
+    Payment Receipt - Activity 2: Payment Receipt.
+    Creates: Dr Cash/Bank, Cr Accounts Receivable
+    """
+
+    class PaymentMethod(models.TextChoices):
+        CASH = 'cash', 'Cash'
+        BANK_TRANSFER = 'bank_transfer', 'Bank Transfer'
+        ECOCASH = 'ecocash', 'EcoCash'
+        CARD = 'card', 'Card'
+        CHEQUE = 'cheque', 'Cheque'
+
+    # Mirrors SubsidiaryAccount.AccountCategory so the receipt explicitly
+    # carries the bucket it belongs to, instead of having post_to_ledger
+    # guess via income_type.code.
+    class SubAccountCategory(models.TextChoices):
+        RENT = 'rent', 'Rent'
+        LEVY = 'levy', 'Levy'
+        SPECIAL_LEVY = 'special_levy', 'Special Levy'
+        MAINTENANCE = 'maintenance', 'Maintenance'
+        PARKING = 'parking', 'Parking'
+        RATES = 'rates', 'Rates'
+        VAT = 'vat', 'VAT'
+        DEPOSIT = 'deposit', 'Deposit'
+        GENERAL = 'general', 'General'
+
+    receipt_number = models.CharField(max_length=50, unique=True)
+    tenant = models.ForeignKey(
+        RentalTenant, on_delete=models.PROTECT, related_name='receipts'
+    )
+    invoice = models.ForeignKey(
+        Invoice, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='receipts'
+    )
+
+    # Bank account for proper receipt tracking
+    bank_account = models.ForeignKey(
+        'accounting.BankAccount', on_delete=models.SET_NULL,
+        null=True, blank=True, related_name='receipts',
+        help_text='Bank account into which payment was received'
+    )
+
+    # Income type for receipt analysis
+    income_type = models.ForeignKey(
+        'accounting.IncomeType', on_delete=models.SET_NULL,
+        null=True, blank=True, related_name='receipts'
+    )
+
+    # Which landlord sub-account this receipt should credit. When unset,
+    # post_to_ledger derives it from the linked invoice's invoice_type
+    # (or falls back to RENT). Surfaces in the UI so users can categorize
+    # ad-hoc payments without needing an invoice first.
+    sub_account_category = models.CharField(
+        max_length=20,
+        choices=SubAccountCategory.choices,
+        default=SubAccountCategory.RENT,
+        help_text='Landlord sub-account this payment is credited to'
+    )
+
+    date = models.DateField()
+    amount = models.DecimalField(max_digits=18, decimal_places=2)
+    currency = models.CharField(max_length=3, default='USD')
+
+    payment_method = models.CharField(
+        max_length=20,
+        choices=PaymentMethod.choices,
+        default=PaymentMethod.CASH
+    )
+    reference = models.CharField(max_length=100, blank=True)  # Bank ref, EcoCash ref, etc.
+    bank_name = models.CharField(max_length=100, blank=True)  # Legacy field, use bank_account instead
+
+    description = models.TextField(blank=True)
+    notes = models.TextField(blank=True)
+
+    # GL Reference
+    journal = models.ForeignKey(
+        Journal, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='receipts'
+    )
+
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True,
+        related_name='created_receipts'
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = 'Receipt'
+        verbose_name_plural = 'Receipts'
+        ordering = ['-date', '-created_at']
+        indexes = [
+            models.Index(fields=['tenant']),
+            models.Index(fields=['invoice']),
+            models.Index(fields=['date']),
+            models.Index(fields=['payment_method']),
+            models.Index(fields=['currency']),
+            models.Index(fields=['tenant', 'date']),
+            models.Index(fields=['date', 'invoice']),
+        ]
+
+    def __str__(self):
+        return f'{self.receipt_number} - {self.tenant.name}'
+
+    def save(self, *args, **kwargs):
+        if not self.receipt_number:
+            with transaction.atomic():
+                self.receipt_number = self.generate_receipt_number()
+                super().save(*args, **kwargs)
+                return
+        super().save(*args, **kwargs)
+
+    @classmethod
+    def generate_receipt_number(cls):
+        from django.utils import timezone
+        prefix = timezone.now().strftime('RCT%Y%m%d')
+        last = cls.all_objects.select_for_update().filter(receipt_number__startswith=prefix).order_by('-receipt_number').first()
+        if last:
+            num = int(last.receipt_number[len(prefix):]) + 1
+        else:
+            num = 1
+        return f'{prefix}{num:04d}'
+
+    def _resolve_cash_account(self):
+        """Get the cash/bank GL account based on payment method.
+
+        Uses get_or_create so a fresh tenant schema without a fully seeded
+        chart of accounts can still post receipts — the missing account is
+        materialized with a sensible default and marked as a system account.
+        """
+        if self.payment_method == self.PaymentMethod.CASH:
+            account, _ = ChartOfAccount.objects.get_or_create(
+                code='1000',
+                defaults={
+                    'name': 'Cash on Hand',
+                    'account_type': 'asset',
+                    'account_subtype': 'cash',
+                    'is_system': True,
+                },
+            )
+            return account
+        code = '1100' if self.currency == 'USD' else '1110'
+        account, _ = ChartOfAccount.objects.get_or_create(
+            code=code,
+            defaults={
+                'name': 'Bank Account' if code == '1100' else 'Bank Account (ZWG)',
+                'account_type': 'asset',
+                'account_subtype': 'bank',
+                'is_system': True,
+            },
+        )
+        return account
+
+    def _get_cash_contra_code(self):
+        """Get the spec-format cash account code for subsidiary entries."""
+        method_map = {
+            'cash': '4000/001', 'bank_transfer': '4000/002',
+            'ecocash': '4000/004', 'card': '4000/002', 'cheque': '4000/002',
+        }
+        return method_map.get(self.payment_method, '4000/001')
+
+    def _get_payment_method_label(self):
+        """Get a label for the payment method for descriptions."""
+        method_map = {
+            'cash': 'CASH', 'bank_transfer': 'BANK', 'ecocash': 'ECOCASH',
+            'card': 'CARD', 'cheque': 'CHEQUE',
+        }
+        return f'{method_map.get(self.payment_method, "CASH")} {self.currency}'
+
+    def _resolve_landlord_for_receipt(self):
+        """Find the landlord associated with this receipt's tenant/invoice/lease."""
+        if self.invoice and self.invoice.unit:
+            return self.invoice.unit.property.landlord
+        if self.invoice and self.invoice.lease:
+            # Levy leases have no unit — use property directly
+            lease = self.invoice.lease
+            if lease.unit:
+                return lease.unit.property.landlord
+            elif lease.property:
+                return lease.property.landlord
+        # Try via invoice property (levy invoices)
+        if self.invoice and self.invoice.property:
+            return self.invoice.property.landlord
+        # Try via tenant's active lease
+        from apps.masterfile.models import LeaseAgreement
+        active_lease = LeaseAgreement.objects.filter(
+            tenant=self.tenant, status='active'
+        ).select_related('unit__property__landlord', 'property__landlord').first()
+        if active_lease:
+            if active_lease.unit:
+                return active_lease.unit.property.landlord
+            elif active_lease.property:
+                return active_lease.property.landlord
+        return None
+
+    def _resolve_property_for_commission(self):
+        """Resolve the property this receipt is tied to, for commission
+        override lookup. Returns property_id or None.
+
+        Resolution chain (first hit wins):
+          1. invoice.unit.property_id
+          2. invoice.property_id
+          3. invoice.lease.unit.property_id
+          4. invoice.lease.property_id
+          5. tenant's active LeaseAgreement → unit.property_id or property_id
+
+        The chain exists because invoices created via different flows leave
+        different combinations of (unit, property, lease) populated, and ad-
+        hoc receipts (no invoice) need to resolve via the tenant's lease.
+        """
+        if self.invoice_id:
+            inv = self.invoice
+            if inv:
+                if inv.unit_id and inv.unit and inv.unit.property_id:
+                    return inv.unit.property_id
+                if inv.property_id:
+                    return inv.property_id
+                if inv.lease_id and inv.lease:
+                    if inv.lease.unit_id and inv.lease.unit and inv.lease.unit.property_id:
+                        return inv.lease.unit.property_id
+                    if inv.lease.property_id:
+                        return inv.lease.property_id
+
+        # No invoice or invoice has no property linkage — fall back to the
+        # tenant's active lease.
+        from apps.masterfile.models import LeaseAgreement
+        active_lease = LeaseAgreement.objects.filter(
+            tenant_id=self.tenant_id, status='active'
+        ).select_related('unit__property', 'property').first()
+        if active_lease:
+            if active_lease.unit_id and active_lease.unit and active_lease.unit.property_id:
+                return active_lease.unit.property_id
+            if active_lease.property_id:
+                return active_lease.property_id
+        return None
+
+    def _get_commission_settings(self):
+        """Resolve commission rate and VAT rate for this receipt.
+
+        Resolution order for the commission rate (descending priority):
+          1. PropertyIncomeCommission(property, income_type) override —
+             per-(property, income_type) rate the agency negotiated with
+             the landlord (e.g. 10% on rent, 15% on maintenance).
+             APPLIES regardless of IncomeType.is_commissionable —
+             agencies sometimes negotiate commission on income types
+             that are globally non-commissionable for specific properties
+             (e.g. levy fees on a particular block of flats).
+          2. IncomeType.default_commission_rate — fallback when no
+             override exists, applied only when the income type is
+             globally commissionable.
+          3. 0% — when no override AND non-commissionable, or when no
+             income type at all.
+
+        Landlord.commission_rate is no longer consulted; that value lives
+        in the DB during the transition but is dead-weight from the
+        resolver's POV.
+        """
+        vat_rate = Decimal('0.15')
+
+        if not self.income_type:
+            commission_rate = Decimal('0')
+        else:
+            # Resolve the property this receipt is tied to. The resolver tries
+            # progressively wider fallbacks because invoices don't always carry
+            # a direct unit/property FK (older imports, batch generators, and
+            # the InvoiceCreateSerializer that takes only `lease`+`unit` all
+            # leave at least one of these blank). Called via the class so the
+            # unbound form works in tests that pass SimpleNamespace as self.
+            prop_id = Receipt._resolve_property_for_commission(self)
+
+            override_rate = None
+            if prop_id:
+                from apps.masterfile.models import PropertyIncomeCommission
+                override_rate = PropertyIncomeCommission.objects.filter(
+                    property_id=prop_id, income_type_id=self.income_type_id,
+                ).values_list('rate', flat=True).first()
+
+            if override_rate is not None:
+                # Override beats is_commissionable.
+                commission_rate = Decimal(str(override_rate)) / Decimal('100')
+            elif self.income_type.is_commissionable and self.income_type.default_commission_rate:
+                # No override — use IncomeType default only if globally commissionable.
+                commission_rate = self.income_type.default_commission_rate / Decimal('100')
+            else:
+                commission_rate = Decimal('0')
+
+        if self.income_type and self.income_type.is_vatable:
+            vat_rate = self.income_type.vat_rate / Decimal('100')
+
+        return commission_rate, vat_rate
+
+    def _calculate_commission(self, amount, gross_rate, vat_rate):
+        """
+        Calculate commission using gross-first approach per spec:
+
+        Gross Commission = amount * gross_rate (rounded to 2dp)
+        Net Commission = Gross / (1 + vat_rate) (rounded to 2dp)
+        VAT on Commission = Gross - Net
+
+        This ensures Gross is always exact (e.g., 8% of $1000 = $80.00 exactly)
+        and Net + VAT = Gross with zero rounding drift.
+        """
+        amount = Decimal(str(amount))
+        gross_rate = Decimal(str(gross_rate))
+        vat_rate = Decimal(str(vat_rate))
+
+        if gross_rate <= 0:
+            return Decimal('0'), Decimal('0'), Decimal('0')
+
+        # Step 1: Gross first (exact)
+        gross_commission = (amount * gross_rate).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+
+        # Step 2: Derive Net from Gross
+        net_commission = (gross_commission / (Decimal('1') + vat_rate)).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+
+        # Step 3: VAT = Gross - Net (ensures no rounding drift)
+        vat_on_commission = gross_commission - net_commission
+
+        return net_commission, vat_on_commission, gross_commission
+
+    @transaction.atomic
+    def post_to_ledger(self, user=None):
+        """
+        Post receipt to General Ledger — Activities 2, 3, and 4.
+        This is the primary posting method implementing trust accounting.
+
+        Activity 2 (Receipting): 2 transactions
+            GL: Dr Cash/Bank, Cr Accounts Receivable
+            Subsidiary: Dr Cash acc, Cr Tenant acc
+
+        Activity 3 (Transfer to Landlord): 2 transactions
+            GL: Dr Unpaid Rent, Cr Landlord Trust Payable
+            Subsidiary: Dr Unpaid Rent, Cr Landlord acc
+
+        Activity 4 (Commission Allocation): 3 transactions
+            GL: Dr Landlord Trust Payable, Cr Commission Revenue, Cr VAT Payable
+            Subsidiary: Cr Commission acc, Cr VAT acc, Dr Landlord acc
+
+        Total: 7 automated transactions per receipt.
+        """
+        if self.journal:
+            return self.journal
+
+        def get_or_create_account(code, name, account_type, account_subtype):
+            account, _ = ChartOfAccount.objects.get_or_create(
+                code=code,
+                defaults={
+                    'name': name,
+                    'account_type': account_type,
+                    'account_subtype': account_subtype,
+                    'is_system': True
+                }
+            )
+            return account
+
+        # === Resolve accounts ===
+        cash_account = self._resolve_cash_account()
+        ar_account, _ = ChartOfAccount.objects.get_or_create(
+            code='1200',
+            defaults={
+                'name': 'Accounts Receivable',
+                'account_type': 'asset',
+                'account_subtype': 'accounts_receivable',
+                'is_system': True,
+            },
+        )
+        unpaid_rent_account = get_or_create_account(
+            '2200', 'Unpaid Rent (Deferred Revenue)', 'liability', 'tenant_deposits'
+        )
+        landlord_trust_account = get_or_create_account(
+            '2300', 'Landlord Trust Payable', 'liability', 'accounts_payable'
+        )
+        commission_revenue_account = get_or_create_account(
+            '4100', 'Commission Revenue', 'revenue', 'commission_income'
+        )
+        vat_payable_account = get_or_create_account(
+            '2110', 'VAT Payable', 'liability', 'vat_payable'
+        )
+
+        # === Resolve entities ===
+        landlord = self._resolve_landlord_for_receipt()
+        commission_rate, vat_rate = self._get_commission_settings()
+        net_commission, vat_on_commission, gross_commission = self._calculate_commission(
+            self.amount, commission_rate, vat_rate
+        )
+
+        # === Build description ===
+        payment_label = self._get_payment_method_label()
+        unit_label = ''
+        lease_ref = ''
+        if self.invoice and self.invoice.unit:
+            unit_label = f'{self.invoice.unit.property.name}-{self.invoice.unit.unit_number}'
+        if self.invoice and self.invoice.lease_id:
+            lease_ref = f'Lease ID {self.invoice.lease_id}'
+
+        base_desc = build_transaction_description(
+            txn_type='Rent Payment',
+            payment_method=payment_label,
+            tenant_name=self.tenant.name,
+            unit=unit_label or None,
+            lease=lease_ref or None,
+            user_ref=self.description or None,
+        )
+
+        # === Create Receipt Journal (Activities 2+3) ===
+        journal = Journal.objects.create(
+            journal_type=Journal.JournalType.RECEIPTS,
+            date=self.date,
+            description=f'Receipt {self.receipt_number} - {self.tenant.name}',
+            reference=self.receipt_number,
+            currency=self.currency,
+            created_by=user
+        )
+
+        # --- Activity 2: Payment Receipt ---
+        # GL: Dr Cash/Bank
+        je_cash_dr = JournalEntry.objects.create(
+            journal=journal, account=cash_account,
+            description=base_desc, debit_amount=self.amount,
+            source_type='receipt', source_id=self.id
+        )
+        # GL: Cr Accounts Receivable
+        je_ar_cr = JournalEntry.objects.create(
+            journal=journal, account=ar_account,
+            description=base_desc, credit_amount=self.amount,
+            source_type='receipt', source_id=self.id
+        )
+
+        # --- Activity 3: Transfer to Landlord ---
+        # GL: Dr Unpaid Rent (clear deferred revenue)
+        je_unpaid_dr = JournalEntry.objects.create(
+            journal=journal, account=unpaid_rent_account,
+            description=base_desc, debit_amount=self.amount,
+            source_type='receipt', source_id=self.id
+        )
+        # GL: Cr Landlord Trust Payable (money now owed to landlord)
+        je_trust_cr = JournalEntry.objects.create(
+            journal=journal, account=landlord_trust_account,
+            description=base_desc, credit_amount=self.amount,
+            source_type='receipt', source_id=self.id
+        )
+
+        # --- Activity 4: Commission Allocation ---
+        je_trust_dr = None
+        je_comm_cr = None
+        je_vat_cr = None
+        if gross_commission > Decimal('0'):
+            # GL: Dr Landlord Trust Payable (reduce what's owed for commission)
+            je_trust_dr = JournalEntry.objects.create(
+                journal=journal, account=landlord_trust_account,
+                description=f'Rent Commission-{base_desc}',
+                debit_amount=gross_commission,
+                source_type='receipt', source_id=self.id
+            )
+            # GL: Cr Commission Revenue (net commission — agent's income)
+            je_comm_cr = JournalEntry.objects.create(
+                journal=journal, account=commission_revenue_account,
+                description=f'Rent Commission-{base_desc}',
+                credit_amount=net_commission,
+                source_type='receipt', source_id=self.id
+            )
+            # GL: Cr VAT Payable
+            je_vat_cr = JournalEntry.objects.create(
+                journal=journal, account=vat_payable_account,
+                description=f'VAT-Rent Commission-{base_desc}',
+                credit_amount=vat_on_commission,
+                source_type='receipt', source_id=self.id
+            )
+
+        # Post the journal (updates GL balances)
+        journal.post(user)
+
+        # === Subsidiary Ledger Entries ===
+        tenant_sub = SubsidiaryAccount.get_or_create_for_tenant(self.tenant)
+        # The receipt's sub_account_category is the source of truth for which
+        # landlord sub-account this payment credits. If unset (e.g. legacy
+        # rows), fall back to the linked invoice's invoice_type, then 'rent'.
+        invoice_type = (
+            self.sub_account_category
+            or (self.invoice.invoice_type if self.invoice else None)
+            or 'rent'
+        )
+        billing_contra = Invoice(invoice_type=invoice_type)._get_billing_contra_code()
+        income_contra = Invoice(invoice_type=invoice_type)._get_income_contra_code()
+        unpaid_contra = Invoice(invoice_type=invoice_type)._get_unpaid_contra_code()
+        commission_expense_contra = Invoice(invoice_type=invoice_type)._get_commission_expense_code()
+        cash_contra = self._get_cash_contra_code()
+
+        # Activity 2 Txn 3: Dr Cash subsidiary (not tracked per-entity; skip)
+        # Activity 2 Txn 4: Cr Tenant Account
+        SubsidiaryTransaction.create_entry(
+            account=tenant_sub, date=self.date,
+            contra_account=cash_contra,
+            reference=self.receipt_number,
+            description=base_desc,
+            credit_amount=self.amount,
+            journal_entry=je_ar_cr,
+        )
+
+        if landlord:
+            # Use category-specific landlord sub-account based on invoice type
+            landlord_sub = SubsidiaryAccount.get_or_create_for_landlord_category(
+                landlord, category=invoice_type, currency=self.currency
+            )
+
+            # Activity 3 Txn 6: Cr Landlord Account (rent income transfer)
+            SubsidiaryTransaction.create_entry(
+                account=landlord_sub, date=self.date,
+                contra_account=income_contra,
+                reference=self.receipt_number,
+                description=base_desc,
+                credit_amount=self.amount,
+                journal_entry=je_trust_cr,
+            )
+
+            if gross_commission > Decimal('0'):
+                # Generate commission allocation reference
+                from django.utils import timezone
+                cma_prefix = timezone.now().strftime('CMA%Y%m%d')
+                cma_last = SubsidiaryTransaction.objects.filter(
+                    reference__startswith=cma_prefix
+                ).order_by('-reference').first()
+                if cma_last:
+                    cma_num = int(cma_last.reference[len(cma_prefix):]) + 1
+                else:
+                    cma_num = 1
+                cma_ref = f'{cma_prefix}{cma_num:04d}'
+
+                # Activity 4 Txn 9: Dr Landlord Account (gross commission deducted)
+                SubsidiaryTransaction.create_entry(
+                    account=landlord_sub, date=self.date,
+                    contra_account=commission_expense_contra,
+                    reference=cma_ref,
+                    description=f'Rent Commission-{base_desc}',
+                    debit_amount=gross_commission,
+                    journal_entry=je_trust_dr,
+                )
+
+        # === Update invoice payment status ===
+        self.journal = journal
+        self.save()
+
+        if self.invoice:
+            invoice = Invoice.objects.select_for_update().get(id=self.invoice_id)
+            old_status = invoice.status
+            invoice.amount_paid += self.amount
+            if invoice.amount_paid >= invoice.total_amount:
+                invoice.status = Invoice.Status.PAID
+            else:
+                invoice.status = Invoice.Status.PARTIAL
+            invoice.save()
+
+            if invoice.status != old_status:
+                AuditTrail.objects.create(
+                    action='invoice_payment_applied',
+                    model_name='Invoice',
+                    record_id=invoice.id,
+                    changes={
+                        'invoice_number': invoice.invoice_number,
+                        'receipt_number': self.receipt_number,
+                        'payment_amount': str(self.amount),
+                        'new_amount_paid': str(invoice.amount_paid),
+                        'old_status': old_status,
+                        'new_status': invoice.status,
+                    },
+                    user=user
+                )
+
+        return journal
+
+    def post_to_ledger_with_commission(self, user=None):
+        """Legacy alias — post_to_ledger now handles commission automatically."""
+        return self.post_to_ledger(user)
+
+
+class Expense(SoftDeleteModel):
+    """
+    Expense/Payout - Activity 5: Expense Payouts.
+    For landlord payments, maintenance, etc.
+    """
+
+    class ExpenseType(models.TextChoices):
+        LANDLORD_PAYMENT = 'landlord_payment', 'Landlord Payment'
+        MAINTENANCE = 'maintenance', 'Maintenance'
+        UTILITY = 'utility', 'Utility'
+        COMMISSION = 'commission', 'Commission'
+        OTHER = 'other', 'Other'
+
+    class Status(models.TextChoices):
+        PENDING = 'pending', 'Pending'
+        APPROVED = 'approved', 'Approved'
+        PAID = 'paid', 'Paid'
+        CANCELLED = 'cancelled', 'Cancelled'
+
+    # Cash expenses leave a real bank/cash account and reduce the landlord's
+    # trust sub-account. Non-cash expenses (accruals, depreciation) hit a
+    # payables/accrual liability account instead — they appear on the P&L
+    # but don't touch cash or the trust ledger.
+    class ExpenseKind(models.TextChoices):
+        CASH = 'cash', 'Cash'
+        NON_CASH = 'non_cash', 'Non-Cash'
+
+    # Mirrors SubsidiaryAccount.AccountCategory so the user can explicitly
+    # pick which of the landlord's trust pockets gets debited, instead of
+    # always inheriting from the expense_category's funding_category.
+    class SubAccountCategory(models.TextChoices):
+        RENT = 'rent', 'Rent'
+        LEVY = 'levy', 'Levy'
+        SPECIAL_LEVY = 'special_levy', 'Special Levy'
+        MAINTENANCE = 'maintenance', 'Maintenance'
+        PARKING = 'parking', 'Parking'
+        RATES = 'rates', 'Rates'
+        VAT = 'vat', 'VAT'
+        DEPOSIT = 'deposit', 'Deposit'
+        GENERAL = 'general', 'General'
+
+    expense_number = models.CharField(max_length=50, unique=True)
+    expense_type = models.CharField(
+        max_length=20,
+        choices=ExpenseType.choices,
+        default=ExpenseType.OTHER
+    )
+    expense_kind = models.CharField(
+        max_length=20,
+        choices=ExpenseKind.choices,
+        default=ExpenseKind.CASH,
+        help_text='Cash leaves the bank; Non-Cash is an accrual / depreciation'
+    )
+    status = models.CharField(
+        max_length=20,
+        choices=Status.choices,
+        default=Status.PENDING
+    )
+
+    # Payee info (could be landlord, vendor, etc.)
+    payee_name = models.CharField(max_length=255)
+    payee_type = models.CharField(max_length=50)  # 'landlord', 'vendor'
+    payee_id = models.PositiveIntegerField(null=True, blank=True)
+
+    date = models.DateField()
+    amount = models.DecimalField(max_digits=18, decimal_places=2)
+    currency = models.CharField(max_length=3, default='USD')
+
+    description = models.TextField()
+    reference = models.CharField(max_length=100, blank=True)
+
+    # Categorization
+    expense_category = models.ForeignKey(
+        'accounting.ExpenseCategory', on_delete=models.SET_NULL,
+        null=True, blank=True, related_name='expenses'
+    )
+    income_type = models.ForeignKey(
+        'accounting.IncomeType', on_delete=models.SET_NULL,
+        null=True, blank=True, related_name='expenses',
+        help_text='Income category this expense is matched against'
+    )
+
+    # Bank account the funds are coming from. Drives currency selection
+    # (the chosen bank account locks the currency for the whole transaction)
+    # and provides the cash GL account for posting.
+    bank_account = models.ForeignKey(
+        'accounting.BankAccount', on_delete=models.PROTECT,
+        null=True, blank=True, related_name='expenses',
+        help_text='Source of funds — drives currency and cash GL account'
+    )
+
+    # Landlord whose sub-account is credited on posting. Combined with the
+    # expense_category's funding_category, the posting engine knows which
+    # of the landlord's sub-accounts (Rent / Maintenance / Rates / etc.)
+    # to debit on the trust ledger.
+    landlord = models.ForeignKey(
+        'masterfile.Landlord', on_delete=models.PROTECT,
+        null=True, blank=True, related_name='expenses',
+        help_text='Landlord whose trust sub-account funds this expense'
+    )
+
+    # Structured payee — third-party vendor/service provider. When set,
+    # payee_type/payee_id/payee_name still get populated from this for
+    # backwards compatibility with existing reports.
+    supplier = models.ForeignKey(
+        'masterfile.Supplier', on_delete=models.PROTECT,
+        null=True, blank=True, related_name='expenses',
+        help_text='Vendor / service provider paid (e.g. City of Harare)'
+    )
+
+    # Explicit sub-account override. When set, post_to_ledger debits this
+    # pocket on the landlord's trust ledger; otherwise it falls back to the
+    # expense_category's funding_category. Only used for cash expenses.
+    sub_account_category = models.CharField(
+        max_length=20,
+        choices=SubAccountCategory.choices,
+        blank=True, default='',
+        help_text="Which of the landlord's trust pockets to deduct from"
+    )
+
+    # GL Reference
+    journal = models.ForeignKey(
+        Journal, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='expenses'
+    )
+
+    approved_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='approved_expenses'
+    )
+    approved_at = models.DateTimeField(null=True, blank=True)
+
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True,
+        related_name='created_expenses'
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = 'Expense'
+        verbose_name_plural = 'Expenses'
+        ordering = ['-date', '-created_at']
+        indexes = [
+            models.Index(fields=['status', 'date']),
+            models.Index(fields=['expense_type']),
+            models.Index(fields=['date']),
+            models.Index(fields=['payee_type', 'payee_id']),
+            models.Index(fields=['currency']),
+        ]
+
+    def __str__(self):
+        return f'{self.expense_number} - {self.payee_name}'
+
+    def save(self, *args, **kwargs):
+        if not self.expense_number:
+            with transaction.atomic():
+                self.expense_number = self.generate_expense_number()
+                super().save(*args, **kwargs)
+                return
+        super().save(*args, **kwargs)
+
+    @classmethod
+    def generate_expense_number(cls):
+        from django.utils import timezone
+        prefix = timezone.now().strftime('EXP%Y%m%d')
+        last = cls.all_objects.select_for_update().filter(expense_number__startswith=prefix).order_by('-expense_number').first()
+        if last:
+            num = int(last.expense_number[len(prefix):]) + 1
+        else:
+            num = 1
+        return f'{prefix}{num:04d}'
+
+    @transaction.atomic
+    def post_to_ledger(self, user=None):
+        """
+        Post expense to General Ledger — Activity 5: Expense Posting.
+
+        Branches on expense_kind:
+            - cash: Dr Expense GL, Cr Bank GL, plus a Dr to the landlord's
+              trust sub-account (reduces money the agent holds on their
+              behalf for the matching funding category).
+            - non_cash: Dr Expense GL, Cr a generic Accrued Liabilities
+              GL (code 2400). Skips the trust sub-account entry — the
+              expense exists for P&L purposes but doesn't move cash.
+
+        Resolution rules:
+            - Expense GL = expense_category.gl_account_zwg when currency
+              is ZWG and the parallel account exists; otherwise
+              expense_category.gl_account.
+            - Cash GL = self.bank_account.gl_account, falling back to
+              code 1100 if not wired (cash kind only).
+            - Landlord sub-account = landlord's sub-account for
+              expense_category.funding_category (cash kind only).
+        """
+        from django.core.exceptions import ValidationError as DjangoValidationError
+
+        if self.journal:
+            return self.journal
+
+        is_non_cash = self.expense_kind == self.ExpenseKind.NON_CASH
+
+        # Expense GL account — pick USD or ZWG variant per currency.
+        cat = self.expense_category
+        if cat and cat.gl_account:
+            if self.currency == 'ZWG' and cat.gl_account_zwg_id:
+                expense_account = cat.gl_account_zwg
+            else:
+                expense_account = cat.gl_account
+        else:
+            expense_account = ChartOfAccount.objects.filter(account_type='expense').first()
+            if not expense_account:
+                raise DjangoValidationError(
+                    'No expense_category set and no fallback expense account exists.'
+                )
+
+        # Credit-side account: bank for cash, accrued liabilities for non-cash.
+        if is_non_cash:
+            credit_account, _ = ChartOfAccount.objects.get_or_create(
+                code='2400',
+                defaults={
+                    'name': 'Accrued Liabilities',
+                    'account_type': 'liability',
+                    'account_subtype': 'accrued_liabilities',
+                    'is_system': True,
+                },
+            )
+            credit_description = f'Accrued: {self.payee_name}'
+        else:
+            if self.bank_account and self.bank_account.gl_account:
+                credit_account = self.bank_account.gl_account
+            else:
+                credit_account, _ = ChartOfAccount.objects.get_or_create(
+                    code='1100',
+                    defaults={
+                        'name': 'Bank Account',
+                        'account_type': 'asset',
+                        'account_subtype': 'bank',
+                        'is_system': True,
+                    },
+                )
+            credit_description = f'Payment to {self.payee_name}'
+
+        # Create journal — type is PAYMENTS for cash, GENERAL for accruals
+        # so the cash journal listing isn't polluted by non-cash adjustments.
+        journal = Journal.objects.create(
+            journal_type=(
+                Journal.JournalType.GENERAL if is_non_cash
+                else Journal.JournalType.PAYMENTS
+            ),
+            date=self.date,
+            description=(
+                f'Accrual {self.expense_number} - {self.payee_name}'
+                if is_non_cash else
+                f'Expense {self.expense_number} - {self.payee_name}'
+            ),
+            reference=self.expense_number,
+            currency=self.currency,
+            created_by=user,
+        )
+
+        je_debit = JournalEntry.objects.create(
+            journal=journal,
+            account=expense_account,
+            description=self.description,
+            debit_amount=self.amount,
+            source_type='expense',
+            source_id=self.id,
+        )
+
+        JournalEntry.objects.create(
+            journal=journal,
+            account=credit_account,
+            description=credit_description,
+            credit_amount=self.amount,
+            source_type='expense',
+            source_id=self.id,
+        )
+
+        journal.post(user)
+
+        # === Subsidiary Ledger Entry for the landlord ===
+        # Non-cash expenses don't touch the trust ledger — they're P&L only.
+        # Cash expenses reduce the landlord's matching sub-account.
+        landlord_obj = self.landlord
+        if landlord_obj is None and self.payee_type == 'landlord' and self.payee_id:
+            from apps.masterfile.models import Landlord
+            landlord_obj = Landlord.objects.filter(id=self.payee_id).first()
+
+        if landlord_obj and not is_non_cash:
+            # Explicit pick on the expense wins over the category default,
+            # so users can override which trust pocket is deducted (e.g. a
+            # maintenance expense funded out of the deposit pocket).
+            funding_cat = (
+                self.sub_account_category
+                or (cat.funding_category if cat and cat.funding_category else 'rent')
+            )
+            landlord_sub = SubsidiaryAccount.get_or_create_for_landlord_category(
+                landlord_obj, category=funding_cat, currency=self.currency
+            )
+            SubsidiaryTransaction.create_entry(
+                account=landlord_sub,
+                date=self.date,
+                contra_account=expense_account.code if expense_account else '',
+                reference=self.expense_number,
+                description=self.description,
+                debit_amount=self.amount,
+                journal_entry=je_debit,
+            )
+
+        self.journal = journal
+        self.status = self.Status.PAID
+        self.save()
+
+        return journal
+
+
+class LatePenaltyConfig(models.Model):
+    """Configuration for automated late payment penalties."""
+
+    class PenaltyType(models.TextChoices):
+        PERCENTAGE = 'percentage', 'Percentage of Invoice'
+        FLAT_FEE = 'flat_fee', 'Flat Fee'
+        BOTH = 'both', 'Percentage + Flat Fee'
+
+    property = models.ForeignKey(
+        Property, on_delete=models.CASCADE, null=True, blank=True,
+        related_name='penalty_configs',
+        help_text='Apply to all tenants in this property (null = system default)'
+    )
+    tenant = models.ForeignKey(
+        RentalTenant, on_delete=models.CASCADE, null=True, blank=True,
+        related_name='penalty_configs',
+        help_text='Override for a specific tenant'
+    )
+
+    penalty_type = models.CharField(
+        max_length=20, choices=PenaltyType.choices, default=PenaltyType.PERCENTAGE
+    )
+    percentage_rate = models.DecimalField(
+        max_digits=5, decimal_places=2, default=Decimal('5.00'),
+        help_text='Percentage of overdue amount'
+    )
+    flat_fee = models.DecimalField(
+        max_digits=18, decimal_places=2, default=Decimal('0.00')
+    )
+    currency = models.CharField(max_length=3, default='USD')
+
+    grace_period_days = models.PositiveIntegerField(
+        default=0,
+        help_text='Additional days after due date before penalty applies'
+    )
+    max_penalty_amount = models.DecimalField(
+        max_digits=18, decimal_places=2, null=True, blank=True,
+        help_text='Maximum penalty amount (null = no cap)'
+    )
+    max_penalties_per_invoice = models.PositiveIntegerField(
+        default=1,
+        help_text='0 = recurring monthly, 1 = one-time, N = max N penalties'
+    )
+
+    is_enabled = models.BooleanField(default=True)
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = 'Late Penalty Configuration'
+        verbose_name_plural = 'Late Penalty Configurations'
+        indexes = [
+            models.Index(fields=['tenant', 'is_enabled']),
+            models.Index(fields=['property', 'is_enabled']),
+        ]
+        ordering = ['-created_at']
+
+    def __str__(self):
+        target = self.tenant or self.property or 'System Default'
+        return f'Penalty Config: {self.penalty_type} for {target}'
+
+    def calculate_penalty(self, overdue_amount):
+        """Calculate the penalty amount for a given overdue amount."""
+        penalty = Decimal('0')
+
+        if self.penalty_type in ('percentage', 'both'):
+            penalty += overdue_amount * (self.percentage_rate / Decimal('100'))
+
+        if self.penalty_type in ('flat_fee', 'both'):
+            penalty += self.flat_fee
+
+        if self.max_penalty_amount and penalty > self.max_penalty_amount:
+            penalty = self.max_penalty_amount
+
+        return penalty.quantize(Decimal('0.01'))
+
+
+class LatePenaltyExclusion(models.Model):
+    """Exclude a tenant from late penalties."""
+
+    tenant = models.ForeignKey(
+        RentalTenant, on_delete=models.CASCADE, related_name='penalty_exclusions'
+    )
+    reason = models.TextField()
+    excluded_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True
+    )
+    excluded_until = models.DateField(
+        null=True, blank=True,
+        help_text='Null = permanent exclusion'
+    )
+
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        verbose_name = 'Late Penalty Exclusion'
+        verbose_name_plural = 'Late Penalty Exclusions'
+        indexes = [
+            models.Index(fields=['tenant']),
+        ]
+        ordering = ['-created_at']
+
+    def __str__(self):
+        return f'Exclusion: {self.tenant.name}'
+
+    @property
+    def is_active(self):
+        if self.excluded_until is None:
+            return True
+        from django.utils import timezone
+        return self.excluded_until >= timezone.now().date()

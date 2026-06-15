@@ -1,0 +1,376 @@
+import { useEffect, useState } from 'react'
+import { useQuery, useMutation, useQueryClient, keepPreviousData } from '@tanstack/react-query'
+import { Percent, RotateCcw, Check, Loader2 } from 'lucide-react'
+import { cn } from '../../lib/utils'
+import { propertyCommissionApi, incomeTypeApi } from '../../services/api'
+import { showToast } from '../../lib/toast'
+
+/* CommissionGrid — per-(property, income_type) commission rate editor.
+ *
+ * Two modes:
+ *
+ *   mode='live' (default): bound to a real propertyId. Edits commit on
+ *   blur via the upsert API; cache patches are optimistic; refetch
+ *   confirms. Used on Property Detail → Commissions tab and the JIT
+ *   sub-modal opened from an existing-property edit modal.
+ *
+ *   mode='draft': for the BEFORE-SAVE flow on the new-property modal.
+ *   No API fetch (uses draftGrid endpoint = property-less rows). No
+ *   API mutate either — edits go to the parent via onDraftChange so
+ *   the parent can submit them after the property is created.
+ *
+ * Every row is editable, regardless of IncomeType.is_commissionable.
+ * Setting a per-property override on a globally non-commissionable
+ * type is a valid case (e.g. levy fees on a specific block where the
+ * agency negotiated commission). Backend resolver mirrors this:
+ * override beats is_commissionable.
+ */
+export type CommissionDraft = Record<number, number | null>
+
+export function CommissionGrid({
+  propertyId,
+  propertyName,
+  mode = 'live',
+  draft,
+  onDraftChange,
+}: {
+  propertyId?: number
+  propertyName: string
+  mode?: 'live' | 'draft'
+  draft?: CommissionDraft
+  onDraftChange?: (next: CommissionDraft) => void
+}) {
+  const queryClient = useQueryClient()
+  const isDraft = mode === 'draft'
+  const queryKey = isDraft
+    ? ['property-commissions', 'draft']
+    : ['property-commissions', propertyId]
+  const [savingIds, setSavingIds] = useState<Set<number>>(new Set())
+  const [savedIds, setSavedIds] = useState<Set<number>>(new Set())
+
+  // In draft mode (no propertyId yet) we synthesize the grid client-side
+  // from the IncomeType list — every row starts with override_rate=null,
+  // effective_rate=default_rate (when commissionable) else 0. This avoids
+  // a backend dependency that may lag behind the frontend deploy.
+  // Local drafts (parent-owned) overlay the rendered rows.
+  const { data, isLoading, error } = useQuery({
+    queryKey,
+    queryFn: async () => {
+      if (isDraft) {
+        const r = await incomeTypeApi.list({ page_size: 500 })
+        const items: any[] = r.data?.results || r.data || []
+        const rows = items
+          .filter((it: any) => it.is_active !== false)
+          .sort((a: any, b: any) => (a.name || '').localeCompare(b.name || ''))
+          .map((it: any) => {
+            const defaultRate = Number(it.default_commission_rate) || 0
+            const ovr = draft && draft[it.id] !== undefined ? draft[it.id] : null
+            return {
+              income_type_id: it.id,
+              income_type_code: it.code,
+              income_type_name: it.name,
+              is_commissionable: it.is_commissionable,
+              default_rate: defaultRate,
+              override_rate: ovr,
+              effective_rate:
+                ovr !== null
+                  ? ovr
+                  : it.is_commissionable
+                    ? defaultRate
+                    : 0,
+              override_id: null,
+            }
+          })
+        return { property_id: null, property_name: '', rows }
+      }
+      return propertyCommissionApi.grid(propertyId!).then(r => r.data)
+    },
+    enabled: isDraft || !!propertyId,
+    placeholderData: keepPreviousData,
+  })
+
+  const upsertMutation = useMutation({
+    mutationFn: (vars: { income_type: number; rate: number | null }) =>
+      propertyCommissionApi.upsert({ property: propertyId!, ...vars }),
+    onMutate: async (vars) => {
+      await queryClient.cancelQueries({ queryKey })
+      const snapshot = queryClient.getQueryData<any>(queryKey)
+      setSavingIds(prev => new Set(prev).add(vars.income_type))
+      queryClient.setQueryData(queryKey, (old: any) => {
+        if (!old?.rows) return old
+        return {
+          ...old,
+          rows: old.rows.map((r: any) =>
+            r.income_type_id === vars.income_type
+              ? {
+                  ...r,
+                  override_rate: vars.rate,
+                  effective_rate:
+                    vars.rate !== null
+                      ? vars.rate
+                      : r.is_commissionable
+                        ? r.default_rate
+                        : 0,
+                }
+              : r,
+          ),
+        }
+      })
+      return { snapshot }
+    },
+    onError: (_err, _vars, ctx: any) => {
+      if (ctx?.snapshot) queryClient.setQueryData(queryKey, ctx.snapshot)
+      showToast.error('Could not save commission rate. Reverted.')
+    },
+    onSuccess: (_resp, vars) => {
+      setSavedIds(prev => new Set(prev).add(vars.income_type))
+      window.setTimeout(() => {
+        setSavedIds(prev => {
+          const next = new Set(prev)
+          next.delete(vars.income_type)
+          return next
+        })
+      }, 1500)
+    },
+    onSettled: (_resp, _err, vars) => {
+      setSavingIds(prev => {
+        const next = new Set(prev)
+        next.delete(vars.income_type)
+        return next
+      })
+      queryClient.invalidateQueries({ queryKey })
+    },
+  })
+
+  const handleSave = (incomeTypeId: number, raw: string) => {
+    const trimmed = raw.trim()
+    const rate = trimmed === '' ? null : Number(trimmed)
+    if (rate !== null && (Number.isNaN(rate) || rate < 0 || rate > 100)) {
+      showToast.error('Commission must be between 0 and 100.')
+      return
+    }
+    if (isDraft) {
+      // Update parent draft state — no API call until property is created.
+      const next: CommissionDraft = { ...(draft || {}) }
+      if (rate === null) delete next[incomeTypeId]
+      else next[incomeTypeId] = rate
+      onDraftChange?.(next)
+      // Patch local cache so the row reflects the edit immediately.
+      queryClient.setQueryData(queryKey, (old: any) => {
+        if (!old?.rows) return old
+        return {
+          ...old,
+          rows: old.rows.map((r: any) =>
+            r.income_type_id === incomeTypeId
+              ? {
+                  ...r,
+                  override_rate: rate,
+                  effective_rate:
+                    rate !== null ? rate : r.is_commissionable ? r.default_rate : 0,
+                }
+              : r,
+          ),
+        }
+      })
+      return
+    }
+    upsertMutation.mutate({ income_type: incomeTypeId, rate })
+  }
+
+  const handleReset = (incomeTypeId: number) => {
+    handleSave(incomeTypeId, '')
+  }
+
+  const rows: any[] = data?.rows || []
+  const overrideCount = rows.filter((r: any) => r.override_rate !== null).length
+
+  return (
+    <div className="bg-white rounded-xl border border-gray-200 overflow-hidden">
+      <div className="p-6 border-b border-gray-100 flex items-center justify-between">
+        <div className="flex items-center gap-3">
+          <div className="w-10 h-10 rounded-lg bg-amber-50 flex items-center justify-center">
+            <Percent className="w-5 h-5 text-amber-600" />
+          </div>
+          <div>
+            <h3 className="text-lg font-semibold text-gray-900">
+              Commission Settings
+              {isDraft && (
+                <span className="ml-2 inline-flex items-center px-2 py-0.5 rounded-full bg-blue-50 text-blue-700 text-xs font-medium align-middle">
+                  Draft — applies on save
+                </span>
+              )}
+            </h3>
+            <p className="text-sm text-gray-500">
+              Per-income-type rates for {propertyName || 'this property'}
+              {overrideCount > 0 && (
+                <span className="ml-2 inline-flex items-center px-2 py-0.5 rounded-full bg-amber-50 text-amber-700 text-xs font-medium">
+                  {overrideCount} override{overrideCount === 1 ? '' : 's'}
+                </span>
+              )}
+            </p>
+          </div>
+        </div>
+      </div>
+
+      <div className="p-6">
+        <p className="text-sm text-gray-600 mb-5 leading-relaxed">
+          Edit any rate and click away (or press Enter) — saves automatically.
+          Leave blank to revert to the income type's default. All income types
+          are editable; setting an override on a non-commissionable type is
+          allowed (the override wins).
+        </p>
+
+        {error ? (
+          <div className="p-4 bg-rose-50 rounded-lg text-rose-700 text-sm">
+            Failed to load commission grid. Please refresh.
+          </div>
+        ) : isLoading ? (
+          <div className="space-y-2">
+            {[...Array(5)].map((_, i) => (
+              <div key={i} className="h-12 bg-gray-100 rounded-lg animate-pulse" />
+            ))}
+          </div>
+        ) : rows.length === 0 ? (
+          <div className="p-6 text-center text-gray-500 text-sm">
+            No active income types. Add some via Setup → Income Types.
+          </div>
+        ) : (
+          <div className="overflow-x-auto -mx-2">
+            <table className="w-full text-sm">
+              <thead>
+                <tr className="text-left border-b border-gray-200">
+                  <th className="pb-3 px-2 font-semibold text-gray-700">Income Type</th>
+                  <th className="pb-3 px-2 font-semibold text-gray-700">Code</th>
+                  <th className="pb-3 px-2 font-semibold text-gray-700 text-right">Default</th>
+                  <th className="pb-3 px-2 font-semibold text-gray-700 text-right">Override</th>
+                  <th className="pb-3 px-2 font-semibold text-gray-700 text-right">Effective</th>
+                  <th className="pb-3 px-2 font-semibold text-gray-700 text-right w-20"></th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-gray-100">
+                {rows.map((row: any) => (
+                  <CommissionRow
+                    key={row.income_type_id}
+                    row={row}
+                    saving={savingIds.has(row.income_type_id)}
+                    saved={savedIds.has(row.income_type_id)}
+                    onSave={(value) => handleSave(row.income_type_id, value)}
+                    onReset={() => handleReset(row.income_type_id)}
+                  />
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
+    </div>
+  )
+}
+
+interface CommissionRowProps {
+  row: any
+  saving: boolean
+  saved: boolean
+  onSave: (value: string) => void
+  onReset: () => void
+}
+
+function CommissionRow({ row, saving, saved, onSave, onReset }: CommissionRowProps) {
+  const overrideStr = row.override_rate !== null ? String(row.override_rate) : ''
+  const [value, setValue] = useState(overrideStr)
+  useEffect(() => { setValue(overrideStr) }, [overrideStr])
+
+  const isDirty = value !== overrideStr
+  const hasOverride = row.override_rate !== null
+
+  const commit = () => {
+    if (!isDirty) return
+    onSave(value)
+  }
+
+  // Default cell shows IncomeType.default_commission_rate. For globally
+  // non-commissionable types, the resolver ignores the default — we
+  // surface that with a muted label "(non-commissionable)" beneath.
+  const defaultDisplay = `${row.default_rate.toFixed(2)}%`
+
+  return (
+    <tr className={cn('transition-colors', saved ? 'bg-emerald-50/60' : 'hover:bg-gray-50/50')}>
+      <td className="py-3 px-2">
+        <div className="font-medium text-gray-900">{row.income_type_name}</div>
+        {!row.is_commissionable && (
+          <div className="text-[10px] text-gray-400 mt-0.5 uppercase tracking-wide">
+            Non-commissionable by default · override applies if set
+          </div>
+        )}
+      </td>
+      <td className="py-3 px-2 font-mono text-xs text-gray-500">
+        {row.income_type_code}
+      </td>
+      <td className="py-3 px-2 text-right tabular-nums text-gray-600">
+        <span className={cn(!row.is_commissionable && 'text-gray-300 line-through')}>
+          {defaultDisplay}
+        </span>
+      </td>
+      <td className="py-3 px-2 text-right">
+        <div className="flex items-center justify-end gap-1.5">
+          {saving && <Loader2 className="w-3 h-3 text-amber-500 animate-spin" />}
+          <input
+            type="number"
+            step="0.01"
+            min="0"
+            max="100"
+            value={value}
+            onChange={(e) => setValue(e.target.value)}
+            onBlur={commit}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter') {
+                e.preventDefault()
+                commit()
+                ;(e.target as HTMLInputElement).blur()
+              } else if (e.key === 'Escape') {
+                setValue(overrideStr)
+                ;(e.target as HTMLInputElement).blur()
+              }
+            }}
+            placeholder={row.default_rate.toFixed(2)}
+            className={cn(
+              'w-20 px-2 py-1 text-right tabular-nums border rounded-lg text-sm',
+              'focus:outline-none focus:ring-2 focus:ring-primary-500 focus:border-transparent',
+              isDirty ? 'border-amber-400 bg-amber-50/40' : 'border-gray-300',
+            )}
+          />
+          <span className="text-gray-400 text-xs">%</span>
+        </div>
+      </td>
+      <td className="py-3 px-2 text-right">
+        <div className="inline-flex items-center justify-end gap-1.5">
+          {saved && <Check className="w-3.5 h-3.5 text-emerald-600" />}
+          <span
+            className={cn(
+              'tabular-nums font-semibold transition-colors',
+              hasOverride ? 'text-amber-700' : (row.effective_rate > 0 ? 'text-gray-900' : 'text-gray-400'),
+            )}
+          >
+            {`${row.effective_rate.toFixed(2)}%`}
+          </span>
+        </div>
+      </td>
+      <td className="py-3 px-2 text-right">
+        {hasOverride && !isDirty && (
+          <button
+            type="button"
+            onClick={onReset}
+            disabled={saving}
+            className="text-xs text-gray-500 hover:text-gray-700 inline-flex items-center gap-1 px-2 py-1 rounded hover:bg-gray-100 transition-colors disabled:opacity-50"
+            title="Reset to default rate"
+          >
+            <RotateCcw className="w-3 h-3" />
+            Reset
+          </button>
+        )}
+      </td>
+    </tr>
+  )
+}
+
+export default CommissionGrid

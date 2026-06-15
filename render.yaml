@@ -1,0 +1,92 @@
+# Cardinal Properties — Render Blueprint (monorepo)
+# Three services: the ERP API (Django/Daphne), the ERP admin app, and the
+# public marketing website. The database is Neon (set DATABASE_URL manually);
+# media goes to DigitalOcean Spaces (set the AWS_* vars manually).
+#
+# Deploy:  Render Dashboard → New → Blueprint → pick this repo → fill the
+# `sync: false` secrets when prompted. See DEPLOY.md for exact values.
+
+services:
+  # ── ERP API ───────────────────────────────────────────────────────────────
+  - type: web
+    name: cardinal-backend
+    runtime: python
+    region: oregon
+    plan: free
+    rootDir: erp/backend
+    buildCommand: "./build.sh"
+    startCommand: "daphne -b 0.0.0.0 -p $PORT config.asgi:application"
+    healthCheckPath: /health/
+    envVars:
+      - key: DJANGO_SETTINGS_MODULE
+        value: config.settings.production
+      - key: PYTHON_VERSION
+        value: "3.11.4"
+      - key: SECRET_KEY
+        generateValue: true
+      - key: DEBUG
+        value: "False"
+      # Neon Postgres (cardinal schema). Paste the UNPOOLED connection string.
+      - key: DATABASE_URL
+        sync: false
+      - key: DB_SCHEMA
+        value: cardinal
+      - key: ALLOWED_HOSTS
+        value: ".onrender.com,.cardinalproperties.co.zw"
+      # Set after the static services get their URLs (comma-separated, no spaces).
+      - key: CORS_ALLOWED_ORIGINS
+        sync: false
+      - key: CSRF_TRUSTED_ORIGINS
+        sync: false
+      # ── DigitalOcean Spaces (S3-compatible media) ──
+      - key: AWS_ACCESS_KEY_ID
+        sync: false
+      - key: AWS_SECRET_ACCESS_KEY
+        sync: false
+      - key: AWS_STORAGE_BUCKET_NAME
+        value: cardinal
+      - key: AWS_S3_ENDPOINT_URL
+        value: https://sfo3.digitaloceanspaces.com
+      - key: AWS_S3_REGION_NAME
+        value: sfo3
+      - key: AWS_S3_CUSTOM_DOMAIN
+        value: cardinal.sfo3.cdn.digitaloceanspaces.com
+      # Optional integrations (leave blank if unused)
+      - key: ANTHROPIC_API_KEY
+        sync: false
+
+  # ── ERP admin app (login + dashboards + CMS) ───────────────────────────────
+  - type: web
+    name: cardinal-erp
+    runtime: static
+    region: oregon
+    plan: free
+    rootDir: erp/frontend
+    buildCommand: "npm ci && npm run build"
+    staticPublishPath: ./dist
+    envVars:
+      - key: VITE_API_URL
+        value: "https://cardinal-backend.onrender.com"
+    routes:
+      - type: rewrite
+        source: /*
+        destination: /index.html
+
+  # ── Public marketing website ───────────────────────────────────────────────
+  - type: web
+    name: cardinal-web
+    runtime: static
+    region: oregon
+    plan: free
+    rootDir: .
+    buildCommand: "npm ci && npm run build"
+    staticPublishPath: ./dist
+    envVars:
+      - key: VITE_ERP_API
+        value: "https://cardinal-backend.onrender.com"
+      - key: VITE_ERP_URL
+        value: "https://cardinal-erp.onrender.com"
+    routes:
+      - type: rewrite
+        source: /*
+        destination: /index.html

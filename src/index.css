@@ -1,0 +1,216 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* SandeMore (demo) — used as a display/accent face for development names and
+   short labels only. NOTE: this demo cut renders the full-stop as a foundry
+   watermark glyph, so never set period-bearing copy in this family. */
+@font-face {
+  font-family: 'SandeMore';
+  src: url('/fonts/SandeMore-Regular.otf') format('opentype');
+  font-weight: 400;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'SandeMore';
+  src: url('/fonts/SandeMore-Medium.otf') format('opentype');
+  font-weight: 500;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'SandeMore';
+  src: url('/fonts/SandeMore-SemiBold.otf') format('opentype');
+  font-weight: 600;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'SandeMore';
+  src: url('/fonts/SandeMore-Bold.otf') format('opentype');
+  font-weight: 700;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'SandeMore';
+  src: url('/fonts/SandeMore-ExtraBold.otf') format('opentype');
+  font-weight: 800;
+  font-display: swap;
+}
+
+html {
+  scroll-behavior: smooth;
+}
+
+body {
+  margin: 0;
+  background: #faf9f6;
+  color: #1a1a1a;
+  font-family: 'Inter', system-ui, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+::selection {
+  background: #75191b;
+  color: #faf9f6;
+}
+
+/* Reveal-on-scroll */
+.reveal {
+  opacity: 0;
+  transform: translateY(28px);
+  transition: opacity 0.9s cubic-bezier(0.16, 1, 0.3, 1),
+    transform 0.9s cubic-bezier(0.16, 1, 0.3, 1);
+}
+.reveal.in {
+  opacity: 1;
+  transform: none;
+}
+
+/* Thin scrollbar */
+.scroll-thin::-webkit-scrollbar {
+  width: 7px;
+  height: 7px;
+}
+.scroll-thin::-webkit-scrollbar-thumb {
+  background: rgba(117, 25, 27, 0.25);
+  border-radius: 8px;
+}
+
+/* Leaflet — keep it light/editorial */
+.leaflet-container {
+  background: #e5e2dc;
+  font-family: 'Inter', system-ui, sans-serif;
+}
+.leaflet-popup-content-wrapper,
+.leaflet-popup-tip {
+  background: #fff;
+  color: #1a1a1a;
+}
+
+.display {
+  font-family: 'Cormorant Garamond', Georgia, serif;
+}
+
+/* ---------------------------------------------------------------------------
+   Material surface — see src/lib/material.ts for the colour helper.
+   Five composited layers turn a flat brand colour into a lit physical chip.
+--------------------------------------------------------------------------- */
+@layer components {
+  .material {
+    position: relative;
+    isolation: isolate;
+    overflow: hidden;
+    background-color: var(--mat-base, #75191b);
+    /* 1 — directional sheen: light rakes across at 135° */
+    background-image: linear-gradient(
+      135deg,
+      var(--mat-light, #9a3133) 0%,
+      var(--mat-base, #75191b) 46%,
+      var(--mat-dark, #59100f) 100%
+    );
+    /* 4 — bevelled edge: lit top, shaded bottom + faint inner ring */
+    box-shadow:
+      inset 0 1px 0 rgba(255, 255, 255, 0.28),
+      inset 0 -1px 1px rgba(0, 0, 0, 0.32),
+      inset 0 0 0 1px rgba(255, 255, 255, 0.05);
+  }
+
+  /* large surfaces (CTA bands): keep the graded sheen + hot-spot, drop the
+     raised-chip bevel so edges don't read as seams */
+  .material.flat {
+    box-shadow: none;
+  }
+
+  /* keep real content above the lighting pseudo-elements */
+  .material > * {
+    position: relative;
+    z-index: 2;
+  }
+
+  /* 2 — specular highlight: soft white hot-spot offset to the top-left */
+  .material::before {
+    content: '';
+    position: absolute;
+    inset: 0;
+    z-index: 1;
+    pointer-events: none;
+    background: radial-gradient(
+      115% 80% at 16% 12%,
+      rgba(255, 255, 255, var(--mat-hot, 0.34)),
+      rgba(255, 255, 255, 0) 58%
+    );
+  }
+
+  /* 3 — finish-aware grain (gloss stays clean; matt/satin get speckle) */
+  .material[data-finish='matt'],
+  .material[data-finish='satin'] {
+    background-image:
+      url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='160' height='160'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='2' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='160' height='160' filter='url(%23n)'/%3E%3C/svg%3E"),
+      linear-gradient(
+        135deg,
+        var(--mat-light, #9a3133) 0%,
+        var(--mat-base, #75191b) 46%,
+        var(--mat-dark, #59100f) 100%
+      );
+    background-size: 160px 160px, cover;
+    background-repeat: repeat, no-repeat;
+  }
+  .material[data-finish='matt'] {
+    background-blend-mode: overlay, normal;
+  }
+  .material[data-finish='satin'] {
+    background-blend-mode: soft-light, normal;
+  }
+
+  /* 5 — light-rake sweep on hover: a skewed translucent band crosses the face */
+  .material.sweep::after {
+    content: '';
+    position: absolute;
+    top: -60%;
+    left: 0;
+    width: 45%;
+    height: 220%;
+    z-index: 3;
+    pointer-events: none;
+    background: linear-gradient(
+      90deg,
+      rgba(255, 255, 255, 0) 0%,
+      rgba(255, 255, 255, 0.45) 50%,
+      rgba(255, 255, 255, 0) 100%
+    );
+    transform: translateX(-180%) skewX(-20deg);
+    transition: transform 0.75s cubic-bezier(0.2, 0.7, 0.2, 1);
+  }
+  .material.sweep:hover::after {
+    transform: translateX(320%) skewX(-20deg);
+  }
+}
+
+/* Range inputs in the calculator */
+input[type='range'] {
+  -webkit-appearance: none;
+  appearance: none;
+  height: 3px;
+  background: #e5e2dc;
+  border-radius: 999px;
+  outline: none;
+}
+input[type='range']::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  height: 18px;
+  width: 18px;
+  border-radius: 50%;
+  background: #75191b;
+  cursor: pointer;
+  border: 3px solid #faf9f6;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.25);
+}
+input[type='range']::-moz-range-thumb {
+  height: 16px;
+  width: 16px;
+  border-radius: 50%;
+  background: #75191b;
+  cursor: pointer;
+  border: 3px solid #faf9f6;
+}

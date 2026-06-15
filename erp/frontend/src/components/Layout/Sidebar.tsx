@@ -1,0 +1,375 @@
+import { useState } from 'react'
+import { NavLink, Link, useLocation, useNavigate } from 'react-router-dom'
+import { motion, AnimatePresence } from 'framer-motion'
+import {
+  LayoutDashboard,
+  Users,
+  Building2,
+  Home,
+  UserCheck,
+  FileText,
+  Receipt,
+  CreditCard,
+  BookOpen,
+  FileSpreadsheet,
+  BarChart3,
+  Shield,
+  ChevronLeft,
+  ChevronRight,
+  UsersRound,
+  ScanLine,
+  Crown,
+  X,
+  Landmark,
+  DollarSign,
+  Wallet,
+  GitCompare,
+  Upload,
+  AlertTriangle,
+  Scale,
+  Trash2,
+  ChevronDown,
+  Wrench,
+  Map,
+  LandPlot,
+  Inbox,
+  FileSignature,
+  Banknote,
+} from 'lucide-react'
+import { useUIStore } from '../../stores/uiStore'
+import { useAuthStore } from '../../stores/authStore'
+import { usePrefetch } from '../../hooks/usePrefetch'
+import { cn } from '../../lib/utils'
+import { SiFsecure } from "react-icons/si";
+import { PiUsersFour } from "react-icons/pi";
+import { LiaUsersSolid } from "react-icons/lia";
+import { PiBuildingApartmentLight } from "react-icons/pi";
+import { TbUserSquareRounded } from "react-icons/tb";
+import { MdOutlineAdminPanelSettings } from "react-icons/md";
+
+
+interface NavItem {
+  name: string
+  href: string
+  icon: React.ComponentType<{ className?: string }>
+}
+
+interface NavSection {
+  title: string
+  items: NavItem[]
+  defaultOpen?: boolean
+}
+
+interface SidebarProps {
+  isMobileDrawer?: boolean
+  onClose?: () => void
+}
+
+const navigation: NavSection[] = [
+  {
+    title: 'Overview',
+    items: [
+      { name: 'Dashboard', href: '/dashboard', icon: LayoutDashboard },
+      { name: 'Reports', href: '/dashboard/reports', icon: BarChart3 },
+    ],
+  },
+  {
+    title: 'Developments · CMS',
+    items: [
+      { name: 'Developments', href: '/dashboard/developments', icon: Map },
+      { name: 'Stands', href: '/dashboard/stands', icon: LandPlot },
+      { name: 'Website Inquiries', href: '/dashboard/inquiries', icon: Inbox },
+    ],
+  },
+  {
+    title: 'Sales',
+    items: [
+      { name: 'Buyers', href: '/dashboard/buyers', icon: UsersRound },
+      { name: 'Agreements', href: '/dashboard/agreements', icon: FileSignature },
+      { name: 'Payments', href: '/dashboard/payments', icon: Banknote },
+    ],
+  },
+  {
+    title: 'Trust Accounting',
+    defaultOpen: false,
+    items: [
+      { name: 'Financial Overview', href: '/dashboard/financials', icon: BarChart3 },
+      { name: 'Journals', href: '/dashboard/journals', icon: FileSpreadsheet },
+      { name: 'Bank Accounts', href: '/dashboard/bank-accounts', icon: Landmark },
+      { name: 'Bank Reconciliation', href: '/dashboard/bank-reconciliation', icon: Scale },
+      { name: 'Subsidiary Ledger', href: '/dashboard/subsidiary-ledger', icon: Wallet },
+      { name: 'Project Expenses', href: '/dashboard/expenses', icon: Wallet },
+    ],
+  },
+  {
+    title: 'Chart & Setup',
+    defaultOpen: false,
+    items: [
+      { name: 'Chart of Accounts', href: '/dashboard/chart-of-accounts', icon: BookOpen },
+      { name: 'Revenue Accounts', href: '/dashboard/income-types', icon: DollarSign },
+      { name: 'Expense Accounts', href: '/dashboard/expense-categories', icon: GitCompare },
+      { name: 'Assets & Liabilities', href: '/dashboard/global-accounts', icon: Wallet },
+      { name: 'Opening Balances', href: '/dashboard/opening-balances', icon: BookOpen },
+    ],
+  },
+  {
+    title: 'Administration',
+    items: [
+      { name: 'Team', href: '/dashboard/team', icon: TbUserSquareRounded },
+      { name: 'Document Scanner', href: '/dashboard/document-scanner', icon: ScanLine },
+      { name: 'Data Import', href: '/dashboard/data-import', icon: Upload },
+      { name: 'Audit Trail', href: '/dashboard/audit-trail', icon: SiFsecure },
+      { name: 'Trash', href: '/dashboard/trash', icon: Trash2 },
+    ],
+  },
+]
+
+export default function Sidebar({ isMobileDrawer = false, onClose }: SidebarProps) {
+  const { sidebarOpen, toggleSidebar } = useUIStore()
+  const { user } = useAuthStore()
+  const location = useLocation()
+  const navigate = useNavigate()
+  const prefetch = usePrefetch()
+
+  // Add Super Admin section for super_admin users
+  const isSuperAdmin = user?.role === 'super_admin'
+
+  // Build navigation with conditional Super Admin section
+  const fullNavigation: NavSection[] = isSuperAdmin
+    ? [
+        ...navigation,
+        {
+          title: 'Platform',
+          items: [
+            { name: 'Super Admin', href: '/dashboard/super-admin', icon: MdOutlineAdminPanelSettings },
+          ],
+        },
+      ]
+    : navigation
+
+  // Track which sections are collapsed
+  const [collapsedSections, setCollapsedSections] = useState<Record<string, boolean>>(() => {
+    const initial: Record<string, boolean> = {}
+    for (const section of navigation) {
+      if (section.defaultOpen === false) {
+        initial[section.title] = true
+      }
+    }
+    return initial
+  })
+
+  const toggleSection = (title: string) => {
+    setCollapsedSections(prev => ({ ...prev, [title]: !prev[title] }))
+  }
+
+  // On mobile drawer, always show expanded state
+  const isExpanded = isMobileDrawer ? true : sidebarOpen
+
+  // Handle navigation - close mobile sidebar after navigation
+  const handleNavClick = (href: string) => {
+    if (isMobileDrawer && onClose) {
+      navigate(href)
+      onClose()
+    }
+  }
+
+  return (
+    <motion.aside
+      initial={false}
+      animate={{ width: isExpanded ? 280 : 80 }}
+      transition={{ duration: 0.3, ease: 'easeInOut' }}
+      className={cn(
+        "h-screen bg-white border-r border-gray-200 flex flex-col",
+        isMobileDrawer ? "w-[280px]" : "fixed left-0 top-0 z-40"
+      )}
+    >
+      {/* Logo Section */}
+      <div className="h-16 flex items-center justify-between px-4 border-b border-gray-100">
+        <Link to="/dashboard" className="flex items-center overflow-hidden hover:opacity-80 transition-opacity">
+          {isExpanded ? (
+            <img
+              src="/cardinal-logo-maroon.svg"
+              alt="Cardinal Properties"
+              className="h-8 w-auto flex-shrink-0"
+            />
+          ) : (
+            <div className="grid h-9 w-9 flex-shrink-0 place-items-center rounded-lg bg-primary-700 font-serif text-lg font-medium text-white">
+              C
+            </div>
+          )}
+        </Link>
+
+        {/* Close button for mobile drawer */}
+        {isMobileDrawer && onClose && (
+          <button
+            onClick={onClose}
+            className="p-2 text-gray-500 hover:text-gray-700 hover:bg-gray-100 rounded-lg transition-colors"
+          >
+            <X className="w-5 h-5" />
+          </button>
+        )}
+      </div>
+
+      {/* Navigation */}
+      <nav className="flex-1 overflow-y-auto py-4 px-3 space-y-6 sidebar-scroll">
+        {fullNavigation.map((section) => {
+          const isCollapsed = collapsedSections[section.title]
+          const hasActiveChild = section.items.some(item =>
+            location.pathname === item.href ||
+            (item.href !== '/dashboard' && location.pathname.startsWith(item.href))
+          )
+
+          return (
+          <div key={section.title}>
+            <AnimatePresence>
+              {isExpanded && (
+                <motion.button
+                  type="button"
+                  initial={{ opacity: 0 }}
+                  animate={{ opacity: 1 }}
+                  exit={{ opacity: 0 }}
+                  onClick={() => section.defaultOpen === false || isCollapsed !== undefined ? toggleSection(section.title) : undefined}
+                  className="w-full flex items-center justify-between px-3 mb-2 text-xs font-semibold text-gray-400 uppercase tracking-wider hover:text-gray-600 transition-colors"
+                >
+                  <span>{section.title}</span>
+                  {section.defaultOpen === false || collapsedSections[section.title] !== undefined ? (
+                    <ChevronDown className={cn(
+                      'w-3 h-3 transition-transform',
+                      isCollapsed && '-rotate-90'
+                    )} />
+                  ) : null}
+                </motion.button>
+              )}
+            </AnimatePresence>
+
+            {!isExpanded && section.title !== 'Overview' && (
+              <div className="border-t border-gray-100 mx-3 mb-2" />
+            )}
+
+            <AnimatePresence initial={false}>
+            {(!isCollapsed || hasActiveChild || !isExpanded) && (
+            <motion.div
+              initial={{ height: 0, opacity: 0 }}
+              animate={{ height: 'auto', opacity: 1 }}
+              exit={{ height: 0, opacity: 0 }}
+              transition={{ duration: 0.2 }}
+              className="overflow-hidden"
+            >
+            <div className="space-y-1">
+              {section.items.map((item) => {
+                const isActive = location.pathname === item.href ||
+                  (item.href !== '/dashboard' && location.pathname.startsWith(item.href))
+
+                return isMobileDrawer ? (
+                  // Mobile: use button for navigation to handle close
+                  <button
+                    key={item.href}
+                    onClick={() => handleNavClick(item.href)}
+                    onMouseEnter={() => prefetch(item.href)}
+                    className={cn(
+                      'w-full flex items-center gap-3 px-3 py-2.5 rounded-lg transition-all duration-200 group relative',
+                      isActive
+                        ? 'bg-primary-50 text-primary-700 dark:bg-primary-900/20 dark:text-primary-400'
+                        : 'text-gray-600 hover:bg-gray-50 hover:text-gray-900'
+                    )}
+                  >
+                    {isActive && (
+                      <motion.div
+                        layoutId="mobileActiveIndicator"
+                        className="absolute -left-3 top-0 bottom-0 my-auto w-1 h-6 bg-primary-600 rounded-r-full"
+                        transition={{ type: 'spring', duration: 0.3 }}
+                      />
+                    )}
+
+                    <item.icon
+                      className={cn(
+                        'w-5 h-5 flex-shrink-0 transition-colors',
+                        isActive ? 'text-primary-600' : 'text-gray-400 group-hover:text-gray-600'
+                      )}
+                    />
+
+                    <span className="text-sm font-medium whitespace-nowrap">
+                      {item.name}
+                    </span>
+                  </button>
+                ) : (
+                  // Desktop: use NavLink
+                  <NavLink
+                    key={item.href}
+                    to={item.href}
+                    onMouseEnter={() => prefetch(item.href)}
+                    className={cn(
+                      'flex items-center gap-3 px-3 py-2.5 rounded-lg transition-all duration-200 group relative',
+                      isActive
+                        ? 'bg-primary-50 text-primary-700 dark:bg-primary-900/20 dark:text-primary-400'
+                        : 'text-gray-600 hover:bg-gray-50 hover:text-gray-900'
+                    )}
+                  >
+                    {isActive && (
+                      <motion.div
+                        layoutId="activeIndicator"
+                        className="absolute -left-3 top-0 bottom-0 my-auto w-1 h-6 bg-primary-600 rounded-r-full"
+                        transition={{ type: 'spring', duration: 0.3 }}
+                      />
+                    )}
+
+                    <item.icon
+                      className={cn(
+                        'w-5 h-5 flex-shrink-0 transition-colors',
+                        isActive ? 'text-primary-600' : 'text-gray-400 group-hover:text-gray-600'
+                      )}
+                    />
+
+                    <AnimatePresence>
+                      {isExpanded && (
+                        <motion.span
+                          initial={{ opacity: 0, x: -10 }}
+                          animate={{ opacity: 1, x: 0 }}
+                          exit={{ opacity: 0, x: -10 }}
+                          className="text-sm font-medium whitespace-nowrap"
+                        >
+                          {item.name}
+                        </motion.span>
+                      )}
+                    </AnimatePresence>
+                  </NavLink>
+                )
+              })}
+            </div>
+            </motion.div>
+            )}
+            </AnimatePresence>
+          </div>
+          )
+        })}
+      </nav>
+
+      {/* Collapse Toggle - only show on desktop */}
+      {!isMobileDrawer && (
+        <div className="border-t border-gray-100 p-3">
+          <button
+            onClick={toggleSidebar}
+            className="w-full flex items-center justify-center gap-2 px-3 py-2 text-sm text-gray-600 hover:bg-gray-50 rounded-lg transition-colors"
+          >
+            {isExpanded ? (
+              <>
+                <ChevronLeft className="w-5 h-5" />
+                <span>Collapse</span>
+              </>
+            ) : (
+              <ChevronRight className="w-5 h-5" />
+            )}
+          </button>
+          {/* Build stamp — temporary diagnostic. If you don't see this
+              line on the deployed site, the deploy hasn't published the
+              latest bundle. Bump the string each push during diagnosis. */}
+          {isExpanded && (
+            <div className="mt-2 px-2 py-1 text-[10px] text-gray-400 text-center font-mono tracking-tight">
+              build · operational-layer-v22
+            </div>
+          )}
+        </div>
+      )}
+    </motion.aside>
+  )
+}

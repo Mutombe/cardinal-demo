@@ -1,0 +1,1869 @@
+"""
+Double-Entry Accounting Engine Models.
+Implements T-Account Architecture for Real Estate Accounting.
+
+Activities:
+1. Debt Recognition - Invoice creation (Dr: Accounts Receivable, Cr: Revenue)
+2. Payment Receipt - Cash received (Dr: Cash/Bank, Cr: Accounts Receivable)
+3. Revenue Recognition - Commission earned (Dr: Accounts Receivable, Cr: Commission Income)
+4. Commission/VAT - Tax handling
+5. Expense Payouts - Landlord payments (Dr: Accounts Payable, Cr: Cash)
+"""
+from decimal import Decimal
+from django.db import models, transaction
+from django.core.exceptions import ValidationError
+from django.conf import settings
+from middleware.current_user import get_current_user
+
+
+class ChartOfAccount(models.Model):
+    """Chart of Accounts - defines all account types in the system."""
+
+    class AccountType(models.TextChoices):
+        ASSET = 'asset', 'Asset'
+        LIABILITY = 'liability', 'Liability'
+        EQUITY = 'equity', 'Equity'
+        REVENUE = 'revenue', 'Revenue'
+        EXPENSE = 'expense', 'Expense'
+
+    class AccountSubType(models.TextChoices):
+        # Assets
+        CASH = 'cash', 'Cash & Bank'
+        ACCOUNTS_RECEIVABLE = 'accounts_receivable', 'Accounts Receivable'
+        PREPAID = 'prepaid', 'Prepaid Expenses'
+        FIXED_ASSET = 'fixed_asset', 'Fixed Assets'
+        # Liabilities
+        ACCOUNTS_PAYABLE = 'accounts_payable', 'Accounts Payable'
+        VAT_PAYABLE = 'vat_payable', 'VAT Payable'
+        TENANT_DEPOSITS = 'tenant_deposits', 'Tenant Deposits'
+        # Equity
+        RETAINED_EARNINGS = 'retained_earnings', 'Retained Earnings'
+        CAPITAL = 'capital', 'Capital'
+        # Revenue - Real Estate Income Types
+        RENTAL_INCOME = 'rental_income', 'Rental Income'
+        LEVY_INCOME = 'levy_income', 'Levy Income'
+        SPECIAL_LEVY_INCOME = 'special_levy_income', 'Special Levy Income'
+        RATES_INCOME = 'rates_income', 'Rates Income'
+        PARKING_INCOME = 'parking_income', 'Parking Income'
+        VAT_INCOME = 'vat_income', 'VAT Income'
+        COMMISSION_INCOME = 'commission_income', 'Commission Income'
+        OTHER_INCOME = 'other_income', 'Other Income'
+        # Expenses
+        OPERATING_EXPENSE = 'operating_expense', 'Operating Expenses'
+        MAINTENANCE = 'maintenance', 'Maintenance & Repairs'
+        UTILITIES = 'utilities', 'Utilities'
+        CUSTOM_EXPENSE = 'custom_expense', 'Custom Expense'
+        DEPRECIATION = 'depreciation', 'Depreciation'
+        # Accrual / Accumulated
+        ACCRUED_LIABILITIES = 'accrued_liabilities', 'Accrued Liabilities'
+        ACCUMULATED_DEPRECIATION = 'accumulated_depreciation', 'Accumulated Depreciation'
+
+    class BalanceSheetCategory(models.TextChoices):
+        """User-selected landlord Balance Sheet sub-category.
+
+        Mandatory for asset/liability accounts at creation. The landlord
+        Balance Sheet places each account STRICTLY under the bucket chosen
+        here — no name/subtype guessing. Unset (legacy) accounts fall into
+        the matching 'Other Current ...' bucket on the report.
+        """
+        # Current Asset buckets
+        FUNDS_HELD_IN_TRUST = 'funds_held_in_trust', 'Funds Held in Trust'
+        LESSEES_ARREARS = 'lessees_arrears', 'Lessees Arrears'
+        PREPAYMENTS = 'prepayments', 'Prepayments'
+        OTHER_CURRENT_ASSETS = 'other_current_assets', 'Other Current Assets'
+        # Current Liability buckets
+        FUNDS_OWED_BY_TRUST = 'funds_owed_by_trust', 'Funds Owed by Trust'
+        LESSEES_PREPAYMENTS = 'lessees_prepayments', 'Lessees Prepayments'
+        ACCRUALS = 'accruals', 'Accruals'
+        OTHER_CURRENT_LIABILITIES = 'other_current_liabilities', 'Other Current Liabilities'
+
+    code = models.CharField(max_length=20, unique=True)
+    name = models.CharField(max_length=255)
+    account_type = models.CharField(max_length=20, choices=AccountType.choices)
+    account_subtype = models.CharField(max_length=30, choices=AccountSubType.choices)
+    # Landlord Balance Sheet sub-category (asset/liability accounts only).
+    # Blank for equity/revenue/expense and for legacy rows created before
+    # this field existed; the report treats blank as 'Other Current ...'.
+    balance_sheet_category = models.CharField(
+        max_length=40, choices=BalanceSheetCategory.choices, blank=True, default=''
+    )
+    description = models.TextField(blank=True)
+    parent = models.ForeignKey(
+        'self', on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='children'
+    )
+    is_active = models.BooleanField(default=True)
+    is_system = models.BooleanField(default=False)  # System accounts can't be deleted
+    currency = models.CharField(max_length=3, default='USD')
+
+    # Running balance
+    current_balance = models.DecimalField(max_digits=18, decimal_places=2, default=Decimal('0.00'))
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = 'Account'
+        verbose_name_plural = 'Chart of Accounts'
+        ordering = ['code']
+
+    def __str__(self):
+        return f'{self.code} - {self.name}'
+
+    @property
+    def normal_balance(self):
+        """Return the normal balance side (debit or credit) for this account type."""
+        if self.account_type in ['asset', 'expense']:
+            return 'debit'
+        return 'credit'
+
+
+class ExchangeRate(models.Model):
+    """Exchange rate history for multi-currency support."""
+    from_currency = models.CharField(max_length=3, default='USD')
+    to_currency = models.CharField(max_length=3, default='ZiG')
+    rate = models.DecimalField(max_digits=18, decimal_places=6)
+    effective_date = models.DateField()
+    source = models.CharField(max_length=100, blank=True)  # e.g., "RBZ Official"
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        verbose_name = 'Exchange Rate'
+        verbose_name_plural = 'Exchange Rates'
+        ordering = ['-effective_date']
+        unique_together = ['from_currency', 'to_currency', 'effective_date']
+
+    def __str__(self):
+        return f'{self.from_currency}/{self.to_currency}: {self.rate} ({self.effective_date})'
+
+    @classmethod
+    def get_rate(cls, from_currency, to_currency, date=None):
+        """Get the exchange rate for a given date (or latest if no date)."""
+        from django.utils import timezone
+        date = date or timezone.now().date()
+
+        rate = cls.objects.filter(
+            from_currency=from_currency,
+            to_currency=to_currency,
+            effective_date__lte=date
+        ).order_by('-effective_date').first()
+
+        if rate:
+            return rate.rate
+        return Decimal('1.0')  # Default to 1:1 if no rate found
+
+
+class Journal(models.Model):
+    """
+    Journal - Transaction header for grouping related entries.
+    Each journal represents a complete financial transaction.
+    """
+
+    class JournalType(models.TextChoices):
+        GENERAL = 'general', 'General Journal'
+        SALES = 'sales', 'Sales Journal'
+        RECEIPTS = 'receipts', 'Cash Receipts'
+        PAYMENTS = 'payments', 'Cash Payments'
+        ADJUSTMENT = 'adjustment', 'Adjusting Entry'
+        REVERSAL = 'reversal', 'Reversal Entry'
+
+    class Status(models.TextChoices):
+        DRAFT = 'draft', 'Draft'
+        POSTED = 'posted', 'Posted'
+        REVERSED = 'reversed', 'Reversed'
+
+    journal_number = models.CharField(max_length=50, unique=True)
+    journal_type = models.CharField(max_length=20, choices=JournalType.choices, default=JournalType.GENERAL)
+    date = models.DateField()
+    description = models.TextField()
+    reference = models.CharField(max_length=100, blank=True)  # External reference
+
+    status = models.CharField(max_length=20, choices=Status.choices, default=Status.DRAFT)
+
+    # For reversals
+    reversed_by = models.ForeignKey(
+        'self', on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='reversal_of'
+    )
+    reversal_reason = models.TextField(blank=True)
+
+    # Multi-currency
+    currency = models.CharField(max_length=3, default='USD')
+    exchange_rate = models.DecimalField(max_digits=18, decimal_places=6, default=Decimal('1.0'))
+
+    # Audit
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True,
+        related_name='created_journals'
+    )
+    posted_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True,
+        related_name='posted_journals'
+    )
+    posted_at = models.DateTimeField(null=True, blank=True)
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = 'Journal'
+        verbose_name_plural = 'Journals'
+        ordering = ['-date', '-created_at']
+
+    def __str__(self):
+        return f'{self.journal_number} - {self.description[:50]}'
+
+    def save(self, *args, **kwargs):
+        if not self.journal_number:
+            self.journal_number = self.generate_journal_number()
+        super().save(*args, **kwargs)
+
+    @classmethod
+    def generate_journal_number(cls):
+        from django.utils import timezone
+        prefix = timezone.now().strftime('JRN%Y%m%d')
+        last = cls.objects.filter(journal_number__startswith=prefix).order_by('-journal_number').first()
+        if last:
+            num = int(last.journal_number[len(prefix):]) + 1
+        else:
+            num = 1
+        return f'{prefix}{num:04d}'
+
+    def validate_balance(self):
+        """Validate that debits equal credits."""
+        entries = self.entries.all()
+        total_debit = sum(e.debit_amount for e in entries)
+        total_credit = sum(e.credit_amount for e in entries)
+
+        if total_debit != total_credit:
+            raise ValidationError(
+                f'Journal is unbalanced. Debits: {total_debit}, Credits: {total_credit}'
+            )
+        return True
+
+    @transaction.atomic
+    def post(self, user=None):
+        """Post the journal and update account balances."""
+        from django.utils import timezone
+
+        if self.status != self.Status.DRAFT:
+            raise ValidationError('Only draft journals can be posted')
+
+        self.validate_balance()
+
+        # Update account balances — lock rows to prevent concurrent balance corruption
+        entries = list(self.entries.select_related('account').all())
+        account_ids = [e.account_id for e in entries]
+        # Lock all affected accounts in consistent order to prevent deadlocks
+        locked_accounts = {
+            a.id: a for a in ChartOfAccount.objects.select_for_update().filter(
+                id__in=account_ids
+            ).order_by('id')
+        }
+
+        gl_entries = []
+        for entry in entries:
+            account = locked_accounts[entry.account_id]
+            if entry.debit_amount:
+                if account.normal_balance == 'debit':
+                    account.current_balance += entry.debit_amount
+                else:
+                    account.current_balance -= entry.debit_amount
+            if entry.credit_amount:
+                if account.normal_balance == 'credit':
+                    account.current_balance += entry.credit_amount
+                else:
+                    account.current_balance -= entry.credit_amount
+            account.save(update_fields=['current_balance', 'updated_at'])
+
+            gl_entries.append(GeneralLedger(
+                journal_entry=entry,
+                account=account,
+                date=self.date,
+                description=entry.description or self.description,
+                debit_amount=entry.debit_amount,
+                credit_amount=entry.credit_amount,
+                balance=account.current_balance,
+                currency=self.currency,
+                exchange_rate=self.exchange_rate
+            ))
+
+        GeneralLedger.objects.bulk_create(gl_entries)
+
+        self.status = self.Status.POSTED
+        self.posted_by = user or get_current_user()
+        self.posted_at = timezone.now()
+        self.save()
+
+        # Create audit trail
+        AuditTrail.objects.create(
+            action='journal_posted',
+            model_name='Journal',
+            record_id=self.id,
+            changes={'journal_number': self.journal_number, 'status': 'posted'},
+            user=self.posted_by
+        )
+
+        return True
+
+    @transaction.atomic
+    def reverse(self, reason, user=None):
+        """Create a reversal journal entry."""
+        from django.utils import timezone
+
+        if self.status != self.Status.POSTED:
+            raise ValidationError('Only posted journals can be reversed')
+
+        if not reason:
+            raise ValidationError('Reversal reason is required')
+
+        # Create reversal journal
+        reversal = Journal.objects.create(
+            journal_type=self.JournalType.REVERSAL,
+            date=timezone.now().date(),
+            description=f'Reversal of {self.journal_number}: {reason}',
+            reference=self.journal_number,
+            currency=self.currency,
+            exchange_rate=self.exchange_rate,
+            created_by=user or get_current_user()
+        )
+
+        # Create reversed entries (swap debits and credits)
+        for entry in self.entries.all():
+            JournalEntry.objects.create(
+                journal=reversal,
+                account=entry.account,
+                description=f'Reversal: {entry.description}',
+                debit_amount=entry.credit_amount,
+                credit_amount=entry.debit_amount
+            )
+
+        # Post the reversal
+        reversal.post(user)
+
+        # Mark original as reversed
+        self.status = self.Status.REVERSED
+        self.reversed_by = reversal
+        self.reversal_reason = reason
+        self.save()
+
+        AuditTrail.objects.create(
+            action='journal_reversed',
+            model_name='Journal',
+            record_id=self.id,
+            changes={
+                'journal_number': self.journal_number,
+                'reversed_by': reversal.journal_number,
+                'reason': reason
+            },
+            user=user or get_current_user()
+        )
+
+        return reversal
+
+
+class JournalEntry(models.Model):
+    """
+    Journal Entry - Individual debit/credit line in a journal.
+    Implements strict double-entry: each entry must have either debit OR credit.
+    """
+    journal = models.ForeignKey(Journal, on_delete=models.CASCADE, related_name='entries')
+    account = models.ForeignKey(ChartOfAccount, on_delete=models.PROTECT, related_name='entries')
+    description = models.CharField(max_length=500, blank=True)
+
+    debit_amount = models.DecimalField(max_digits=18, decimal_places=2, default=Decimal('0.00'))
+    credit_amount = models.DecimalField(max_digits=18, decimal_places=2, default=Decimal('0.00'))
+
+    # Optional reference to source document
+    source_type = models.CharField(max_length=50, blank=True)  # e.g., 'invoice', 'receipt'
+    source_id = models.PositiveIntegerField(null=True, blank=True)
+
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        verbose_name = 'Journal Entry'
+        verbose_name_plural = 'Journal Entries'
+        ordering = ['id']
+        indexes = [
+            models.Index(fields=['source_type', 'source_id']),
+        ]
+
+    def __str__(self):
+        if self.debit_amount:
+            return f'Dr: {self.account.code} - {self.debit_amount}'
+        return f'Cr: {self.account.code} - {self.credit_amount}'
+
+    def clean(self):
+        """Validate entry has either debit or credit, not both."""
+        if self.debit_amount and self.credit_amount:
+            raise ValidationError('Entry cannot have both debit and credit amounts')
+        if not self.debit_amount and not self.credit_amount:
+            raise ValidationError('Entry must have either debit or credit amount')
+
+    def save(self, *args, **kwargs):
+        self.full_clean()
+        super().save(*args, **kwargs)
+
+
+class GeneralLedger(models.Model):
+    """
+    General Ledger - Posted transactions with running balances.
+    This is the book of record for all financial transactions.
+    """
+    journal_entry = models.OneToOneField(
+        JournalEntry, on_delete=models.PROTECT, related_name='gl_entry'
+    )
+    account = models.ForeignKey(ChartOfAccount, on_delete=models.PROTECT, related_name='gl_entries')
+    date = models.DateField(db_index=True)
+    description = models.CharField(max_length=500)
+
+    debit_amount = models.DecimalField(max_digits=18, decimal_places=2, default=Decimal('0.00'))
+    credit_amount = models.DecimalField(max_digits=18, decimal_places=2, default=Decimal('0.00'))
+    balance = models.DecimalField(max_digits=18, decimal_places=2)  # Running balance
+
+    currency = models.CharField(max_length=3, default='USD')
+    exchange_rate = models.DecimalField(max_digits=18, decimal_places=6, default=Decimal('1.0'))
+
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        verbose_name = 'General Ledger Entry'
+        verbose_name_plural = 'General Ledger'
+        ordering = ['-date', '-created_at']
+        indexes = [
+            models.Index(fields=['account', 'date']),
+            models.Index(fields=['date']),
+        ]
+
+    def __str__(self):
+        return f'{self.date} - {self.account.code}: Dr {self.debit_amount} / Cr {self.credit_amount}'
+
+
+class AuditTrail(models.Model):
+    """
+    Immutable Audit Trail - Records all sensitive financial actions.
+    This table should NEVER be modified or deleted.
+    """
+    action = models.CharField(max_length=100)
+    model_name = models.CharField(max_length=100)
+    record_id = models.PositiveIntegerField()
+    changes = models.JSONField(default=dict)
+
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True,
+        related_name='audit_actions'
+    )
+    user_email = models.EmailField(blank=True)  # Preserved even if user deleted
+
+    ip_address = models.GenericIPAddressField(null=True, blank=True)
+    user_agent = models.TextField(blank=True)
+
+    timestamp = models.DateTimeField(auto_now_add=True, db_index=True)
+
+    class Meta:
+        verbose_name = 'Audit Trail Entry'
+        verbose_name_plural = 'Audit Trail'
+        ordering = ['-timestamp']
+
+    def __str__(self):
+        return f'{self.timestamp} - {self.action} on {self.model_name}#{self.record_id}'
+
+    def save(self, *args, **kwargs):
+        # Preserve user email
+        if self.user and not self.user_email:
+            self.user_email = self.user.email
+        # Auto-populate IP and user agent from request context if not set
+        if not self.ip_address or not self.user_agent:
+            from middleware.current_user import get_current_request_meta
+            meta = get_current_request_meta()
+            if not self.ip_address and meta.get('ip_address'):
+                self.ip_address = meta['ip_address']
+            if not self.user_agent and meta.get('user_agent'):
+                self.user_agent = meta['user_agent']
+        # Prevent updates to existing records
+        if self.pk:
+            raise ValidationError('Audit trail entries cannot be modified')
+        super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        raise ValidationError('Audit trail entries cannot be deleted')
+
+
+class FiscalPeriod(models.Model):
+    """Fiscal periods for financial reporting."""
+    name = models.CharField(max_length=100)
+    start_date = models.DateField()
+    end_date = models.DateField()
+    is_closed = models.BooleanField(default=False)
+    closed_at = models.DateTimeField(null=True, blank=True)
+    closed_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True,
+        related_name='closed_periods'
+    )
+
+    class Meta:
+        verbose_name = 'Fiscal Period'
+        verbose_name_plural = 'Fiscal Periods'
+        ordering = ['-start_date']
+
+    def __str__(self):
+        return f'{self.name} ({self.start_date} - {self.end_date})'
+
+
+class BankAccount(models.Model):
+    """
+    Bank Account - Represents physical bank accounts for receipt tracking.
+    Examples: FBC Bank, EcoCash, ZB Bank, CABS, Cash
+    """
+
+    class AccountType(models.TextChoices):
+        BANK = 'bank', 'Bank Account'
+        MOBILE_MONEY = 'mobile_money', 'Mobile Money'
+        CASH = 'cash', 'Cash'
+
+    class Currency(models.TextChoices):
+        USD = 'USD', 'US Dollar'
+        ZWG = 'ZWG', 'Zimbabwe Gold (ZiG)'
+        ZWL = 'ZWL', 'Zimbabwe Dollar'
+
+    code = models.CharField(max_length=20, unique=True)
+    name = models.CharField(max_length=255)
+    account_type = models.CharField(max_length=20, choices=AccountType.choices, default=AccountType.BANK)
+
+    # Bank details
+    bank_name = models.CharField(max_length=100)
+    branch = models.CharField(max_length=100, blank=True)
+    account_number = models.CharField(max_length=50, blank=True)
+    swift_code = models.CharField(max_length=20, blank=True)
+
+    # Currency support
+    currency = models.CharField(max_length=3, choices=Currency.choices, default=Currency.USD)
+
+    # GL Integration
+    gl_account = models.ForeignKey(
+        ChartOfAccount, on_delete=models.PROTECT,
+        related_name='bank_accounts',
+        limit_choices_to={'account_subtype': 'cash'}
+    )
+
+    # Balances
+    book_balance = models.DecimalField(max_digits=18, decimal_places=2, default=Decimal('0.00'))
+    bank_balance = models.DecimalField(max_digits=18, decimal_places=2, default=Decimal('0.00'))
+    last_reconciled_date = models.DateField(null=True, blank=True)
+    last_reconciled_balance = models.DecimalField(max_digits=18, decimal_places=2, default=Decimal('0.00'))
+
+    is_active = models.BooleanField(default=True)
+    is_default = models.BooleanField(default=False)
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = 'Bank Account'
+        verbose_name_plural = 'Bank Accounts'
+        ordering = ['name']
+
+    def __str__(self):
+        return f'{self.name} ({self.currency})'
+
+    def save(self, *args, **kwargs):
+        # Ensure only one default per currency
+        if self.is_default:
+            BankAccount.objects.filter(
+                currency=self.currency, is_default=True
+            ).exclude(pk=self.pk).update(is_default=False)
+        if not self.code:
+            with transaction.atomic():
+                self.code = self.generate_code()
+                super().save(*args, **kwargs)
+                return
+        super().save(*args, **kwargs)
+
+    @classmethod
+    def generate_code(cls):
+        last = cls.objects.select_for_update().order_by('-id').first()
+        num = (last.id + 1) if last else 1
+        return f'BA{num:04d}'
+
+    @property
+    def unreconciled_difference(self):
+        """Calculate difference between book and bank balance."""
+        return self.bank_balance - self.book_balance
+
+
+class BankTransaction(models.Model):
+    """
+    Bank Transaction - Records individual bank statement transactions for reconciliation.
+    """
+
+    class Status(models.TextChoices):
+        UNRECONCILED = 'unreconciled', 'Unreconciled'
+        RECONCILED = 'reconciled', 'Reconciled'
+        DISPUTED = 'disputed', 'Disputed'
+
+    class TransactionType(models.TextChoices):
+        CREDIT = 'credit', 'Credit (Deposit)'
+        DEBIT = 'debit', 'Debit (Withdrawal)'
+
+    bank_account = models.ForeignKey(
+        BankAccount, on_delete=models.CASCADE, related_name='transactions'
+    )
+
+    transaction_date = models.DateField()
+    value_date = models.DateField(null=True, blank=True)
+    reference = models.CharField(max_length=255)  # Bank statement reference
+    description = models.TextField(blank=True)
+
+    transaction_type = models.CharField(max_length=10, choices=TransactionType.choices)
+    amount = models.DecimalField(max_digits=18, decimal_places=2)
+    running_balance = models.DecimalField(max_digits=18, decimal_places=2, null=True, blank=True)
+
+    status = models.CharField(max_length=20, choices=Status.choices, default=Status.UNRECONCILED)
+
+    # Matching
+    matched_receipt = models.ForeignKey(
+        'billing.Receipt', on_delete=models.SET_NULL,
+        null=True, blank=True, related_name='bank_transactions'
+    )
+    matched_journal = models.ForeignKey(
+        Journal, on_delete=models.SET_NULL,
+        null=True, blank=True, related_name='bank_transactions'
+    )
+
+    reconciled_at = models.DateTimeField(null=True, blank=True)
+    reconciled_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL,
+        null=True, blank=True, related_name='reconciled_transactions'
+    )
+
+    # AI matching result
+    ai_match_confidence = models.PositiveIntegerField(null=True, blank=True)
+    ai_match_suggestion = models.JSONField(null=True, blank=True)
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = 'Bank Transaction'
+        verbose_name_plural = 'Bank Transactions'
+        ordering = ['-transaction_date', '-created_at']
+        indexes = [
+            models.Index(fields=['bank_account', 'status']),
+            models.Index(fields=['transaction_date']),
+        ]
+
+    def __str__(self):
+        return f'{self.transaction_date} - {self.reference}: {self.amount}'
+
+    @transaction.atomic
+    def reconcile(self, receipt=None, journal=None, user=None):
+        """Mark transaction as reconciled."""
+        from django.utils import timezone
+
+        self.status = self.Status.RECONCILED
+        self.matched_receipt = receipt
+        self.matched_journal = journal
+        self.reconciled_at = timezone.now()
+        self.reconciled_by = user
+        self.save()
+
+        # Lock bank account row to prevent concurrent balance corruption
+        bank_acct = BankAccount.objects.select_for_update().get(id=self.bank_account_id)
+        if self.transaction_type == self.TransactionType.CREDIT:
+            bank_acct.book_balance += self.amount
+        else:
+            bank_acct.book_balance -= self.amount
+        bank_acct.save(update_fields=['book_balance', 'updated_at'])
+
+
+class BankReconciliation(models.Model):
+    """
+    Bank Reconciliation - Reconciliation session/report.
+    """
+
+    class Status(models.TextChoices):
+        DRAFT = 'draft', 'Draft'
+        COMPLETED = 'completed', 'Completed'
+
+    bank_account = models.ForeignKey(
+        BankAccount, on_delete=models.CASCADE, related_name='reconciliations'
+    )
+
+    period_start = models.DateField()
+    period_end = models.DateField()
+
+    statement_balance = models.DecimalField(max_digits=18, decimal_places=2)
+    book_balance = models.DecimalField(max_digits=18, decimal_places=2)
+    adjusted_book_balance = models.DecimalField(max_digits=18, decimal_places=2, null=True, blank=True)
+
+    # Outstanding items
+    outstanding_deposits = models.DecimalField(max_digits=18, decimal_places=2, default=Decimal('0.00'))
+    outstanding_withdrawals = models.DecimalField(max_digits=18, decimal_places=2, default=Decimal('0.00'))
+
+    status = models.CharField(max_length=20, choices=Status.choices, default=Status.DRAFT)
+
+    notes = models.TextField(blank=True)
+
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL,
+        null=True, related_name='created_reconciliations'
+    )
+    completed_at = models.DateTimeField(null=True, blank=True)
+    completed_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL,
+        null=True, blank=True, related_name='completed_reconciliations'
+    )
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = 'Bank Reconciliation'
+        verbose_name_plural = 'Bank Reconciliations'
+        ordering = ['-period_end']
+
+    def __str__(self):
+        return f'{self.bank_account.name} - {self.period_end}'
+
+    # Sage-style month/year fields
+    month = models.PositiveSmallIntegerField(null=True, blank=True)
+    year = models.PositiveSmallIntegerField(null=True, blank=True)
+
+    @property
+    def difference(self):
+        """Calculate reconciliation difference."""
+        if hasattr(self, '_prefetched_objects_cache') and 'items' in self._prefetched_objects_cache:
+            # Use prefetched items for efficiency
+            items = self._prefetched_objects_cache['items']
+            if items:
+                unticked_payments = sum(
+                    i.amount for i in items
+                    if i.item_type == 'payment' and not i.is_reconciled
+                )
+                unticked_receipts = sum(
+                    i.amount for i in items
+                    if i.item_type == 'receipt' and not i.is_reconciled
+                )
+                return (self.statement_balance - self.book_balance) + unticked_payments - unticked_receipts
+        elif self.pk and self.items.exists():
+            # Sage-style: compute from unticked items
+            from django.db.models import Sum as _Sum
+            unticked_payments = self.items.filter(
+                item_type='payment', is_reconciled=False
+            ).aggregate(t=_Sum('amount'))['t'] or Decimal('0')
+            unticked_receipts = self.items.filter(
+                item_type='receipt', is_reconciled=False
+            ).aggregate(t=_Sum('amount'))['t'] or Decimal('0')
+            return (self.statement_balance - self.book_balance) + unticked_payments - unticked_receipts
+        # Fallback for old records
+        adjusted = self.adjusted_book_balance or self.book_balance
+        return self.statement_balance - adjusted
+
+    @property
+    def is_balanced(self):
+        """Check if reconciliation is balanced."""
+        return abs(self.difference) < Decimal('0.01')
+
+
+class ReconciliationItem(models.Model):
+    """Individual line item in a Sage-style reconciliation. Each row is either
+    a receipt (money in) or a payment (money out) for the bank account."""
+
+    class ItemType(models.TextChoices):
+        RECEIPT = 'receipt', 'Receipt'
+        PAYMENT = 'payment', 'Payment'
+
+    reconciliation = models.ForeignKey(
+        BankReconciliation, on_delete=models.CASCADE, related_name='items'
+    )
+    item_type = models.CharField(max_length=10, choices=ItemType.choices)
+
+    # Source references (nullable — items come from different sources)
+    receipt = models.ForeignKey(
+        'billing.Receipt', on_delete=models.SET_NULL,
+        null=True, blank=True, related_name='reconciliation_items'
+    )
+    gl_entry = models.ForeignKey(
+        GeneralLedger, on_delete=models.SET_NULL,
+        null=True, blank=True, related_name='reconciliation_items'
+    )
+
+    # Denormalized for fast rendering (snapshot at creation time)
+    date = models.DateField()
+    reference = models.CharField(max_length=255, blank=True)
+    description = models.CharField(max_length=500, blank=True)
+    amount = models.DecimalField(max_digits=18, decimal_places=2)
+
+    # The key checkbox field
+    is_reconciled = models.BooleanField(default=False)
+    reconciled_at = models.DateTimeField(null=True, blank=True)
+
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['date', 'id']
+        indexes = [
+            models.Index(fields=['reconciliation', 'is_reconciled']),
+        ]
+
+    def __str__(self):
+        return f'{self.item_type} - {self.reference}: {self.amount}'
+
+
+class ExpenseCategory(models.Model):
+    """
+    Dynamic Expense Categories - User-created expense types.
+
+    Each category maps to a GL expense account (USD) and optionally a
+    parallel ZWG account, plus a `funding_category` that tells the
+    posting engine which landlord sub-account to credit (Rent /
+    Maintenance / Rates / Parking / VAT). The default_description
+    pre-fills the Record Expense modal so staff don't retype boilerplate.
+    """
+
+    class FundingCategory(models.TextChoices):
+        RENT = 'rent', 'Rent'
+        MAINTENANCE = 'maintenance', 'Maintenance'
+        RATES = 'rates', 'Rates'
+        PARKING = 'parking', 'Parking'
+        VAT = 'vat', 'VAT'
+
+    code = models.CharField(max_length=20, unique=True)
+    name = models.CharField(max_length=255)
+    description = models.TextField(blank=True)
+
+    # GL account mapping — one for USD, one for ZWG. The posting engine
+    # picks whichever matches the bank account's currency.
+    gl_account = models.ForeignKey(
+        ChartOfAccount, on_delete=models.PROTECT,
+        related_name='expense_categories',
+        limit_choices_to={'account_type': 'expense'},
+        help_text='USD GL account for this expense type'
+    )
+    gl_account_zwg = models.ForeignKey(
+        ChartOfAccount, on_delete=models.SET_NULL,
+        null=True, blank=True,
+        related_name='expense_categories_zwg',
+        limit_choices_to={'account_type': 'expense'},
+        help_text='ZWG GL account (defaults to gl_account if not set)'
+    )
+
+    # Determines which landlord sub-account is credited on posting.
+    funding_category = models.CharField(
+        max_length=20,
+        choices=FundingCategory.choices,
+        default=FundingCategory.RENT,
+        help_text='Landlord sub-account this expense is funded from'
+    )
+
+    # Pre-filled into the Record Expense form so staff don't retype.
+    default_description = models.CharField(
+        max_length=255, blank=True,
+        help_text='Auto-fills the description field on expense creation'
+    )
+
+    # Categorization
+    is_deductible = models.BooleanField(default=True)
+    requires_approval = models.BooleanField(default=False)
+    approval_threshold = models.DecimalField(
+        max_digits=18, decimal_places=2, null=True, blank=True,
+        help_text='Amount above which approval is required'
+    )
+
+    is_active = models.BooleanField(default=True)
+    is_system = models.BooleanField(default=False)
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = 'Expense Category'
+        verbose_name_plural = 'Expense Categories'
+        ordering = ['name']
+
+    def __str__(self):
+        return f'{self.code} - {self.name}'
+
+    def save(self, *args, **kwargs):
+        if not self.code:
+            with transaction.atomic():
+                self.code = self.generate_code()
+                super().save(*args, **kwargs)
+                return
+        super().save(*args, **kwargs)
+
+    @classmethod
+    def generate_code(cls):
+        last = cls.objects.select_for_update().order_by('-id').first()
+        num = (last.id + 1) if last else 1
+        return f'EXP{num:04d}'
+
+
+class JournalReallocation(models.Model):
+    """
+    Journal Reallocation - Track expense reallocations to different accounts.
+    Allows preparers to move expenses to more appropriate accounts after initial allocation.
+    """
+    original_entry = models.ForeignKey(
+        JournalEntry, on_delete=models.PROTECT, related_name='reallocations_from'
+    )
+    new_entry = models.ForeignKey(
+        JournalEntry, on_delete=models.PROTECT, related_name='reallocations_to'
+    )
+
+    from_account = models.ForeignKey(
+        ChartOfAccount, on_delete=models.PROTECT, related_name='reallocated_from'
+    )
+    to_account = models.ForeignKey(
+        ChartOfAccount, on_delete=models.PROTECT, related_name='reallocated_to'
+    )
+
+    amount = models.DecimalField(max_digits=18, decimal_places=2)
+    reason = models.TextField()
+
+    reallocated_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL,
+        null=True, related_name='reallocations'
+    )
+
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        verbose_name = 'Journal Reallocation'
+        verbose_name_plural = 'Journal Reallocations'
+        ordering = ['-created_at']
+
+    def __str__(self):
+        return f'Reallocation: {self.from_account.code} → {self.to_account.code} ({self.amount})'
+
+    @classmethod
+    @transaction.atomic
+    def create_reallocation(cls, original_entry, to_account, amount, reason, user):
+        """
+        Create a reallocation entry.
+        This creates a journal that moves the amount from original account to new account.
+        """
+        from django.utils import timezone
+
+        from_account = original_entry.account
+
+        # Create reallocation journal
+        journal = Journal.objects.create(
+            journal_type=Journal.JournalType.ADJUSTMENT,
+            date=timezone.now().date(),
+            description=f'Reallocation: {from_account.code} → {to_account.code}. Reason: {reason}',
+            created_by=user
+        )
+
+        # Reverse from original account
+        reverse_entry = JournalEntry.objects.create(
+            journal=journal,
+            account=from_account,
+            description=f'Reallocation out - {reason}',
+            credit_amount=amount if from_account.normal_balance == 'debit' else Decimal('0'),
+            debit_amount=Decimal('0') if from_account.normal_balance == 'debit' else amount
+        )
+
+        # Credit to new account
+        new_entry = JournalEntry.objects.create(
+            journal=journal,
+            account=to_account,
+            description=f'Reallocation in - {reason}',
+            debit_amount=amount if to_account.normal_balance == 'debit' else Decimal('0'),
+            credit_amount=Decimal('0') if to_account.normal_balance == 'debit' else amount
+        )
+
+        # Post the journal
+        journal.post(user)
+
+        # Create reallocation record
+        reallocation = cls.objects.create(
+            original_entry=original_entry,
+            new_entry=new_entry,
+            from_account=from_account,
+            to_account=to_account,
+            amount=amount,
+            reason=reason,
+            reallocated_by=user
+        )
+
+        # Audit trail
+        AuditTrail.objects.create(
+            action='expense_reallocated',
+            model_name='JournalReallocation',
+            record_id=reallocation.id,
+            changes={
+                'from_account': from_account.code,
+                'to_account': to_account.code,
+                'amount': str(amount),
+                'reason': reason
+            },
+            user=user
+        )
+
+        return reallocation
+
+
+class IncomeType(models.Model):
+    """
+    Income Type - Defines different types of income for detailed tracking.
+    Links to specific GL accounts and enables income analysis.
+    """
+    code = models.CharField(max_length=20, unique=True)
+    name = models.CharField(max_length=255)
+    description = models.TextField(blank=True)
+
+    # GL account mapping
+    gl_account = models.ForeignKey(
+        ChartOfAccount, on_delete=models.PROTECT,
+        related_name='income_types',
+        limit_choices_to={'account_type': 'revenue'}
+    )
+
+    # Commission settings
+    is_commissionable = models.BooleanField(default=True)
+    default_commission_rate = models.DecimalField(
+        max_digits=5, decimal_places=2, default=Decimal('10.00')
+    )
+
+    # VAT settings
+    is_vatable = models.BooleanField(default=False)
+    vat_rate = models.DecimalField(max_digits=5, decimal_places=2, default=Decimal('15.00'))
+
+    is_active = models.BooleanField(default=True)
+    display_order = models.PositiveIntegerField(default=0)
+    is_system = models.BooleanField(default=False)
+    management_type = models.CharField(
+        max_length=20,
+        choices=[('rental', 'Rental'), ('levy', 'Levy'), ('both', 'Both')],
+        default='both'
+    )
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = 'Income Type'
+        verbose_name_plural = 'Income Types'
+        ordering = ['display_order', 'name']
+
+    def __str__(self):
+        return f'{self.code} - {self.name}'
+
+    def save(self, *args, **kwargs):
+        if not self.code:
+            with transaction.atomic():
+                self.code = self.generate_code()
+                super().save(*args, **kwargs)
+                return
+        super().save(*args, **kwargs)
+
+    @classmethod
+    def generate_code(cls):
+        last = cls.objects.select_for_update().order_by('-id').first()
+        num = (last.id + 1) if last else 1
+        return f'INC{num:04d}'
+
+
+class SubsidiaryAccount(models.Model):
+    """
+    Subsidiary Ledger Account - Individual accounts for tenants, landlords,
+    and account holders. These are sub-ledgers that feed into GL control accounts.
+
+    Tenant accounts (TN/xxxxx) track what each tenant owes.
+    Landlord accounts (LD/xxxxx/SS) track what the agent owes each landlord (trust money).
+      Each landlord can have multiple accounts, one per category+currency combo.
+    Account Holder accounts (AC/xxxxx) track levy payers.
+    """
+
+    class EntityType(models.TextChoices):
+        TENANT = 'tenant', 'Tenant'
+        LANDLORD = 'landlord', 'Landlord'
+        ACCOUNT_HOLDER = 'account_holder', 'Account Holder'
+
+    class AccountCategory(models.TextChoices):
+        RENT = 'rent', 'Rent'
+        LEVY = 'levy', 'Levy'
+        SPECIAL_LEVY = 'special_levy', 'Special Levy'
+        MAINTENANCE = 'maintenance', 'Maintenance'
+        PARKING = 'parking', 'Parking'
+        RATES = 'rates', 'Rates'
+        VAT = 'vat', 'VAT'
+        DEPOSIT = 'deposit', 'Deposit'
+        GENERAL = 'general', 'General'
+
+    # Suffix maps per management type.
+    # Rental: 6 categories × 2 currencies = 12 max sub-accounts
+    # Levy: 5 categories × 2 currencies = 10 max sub-accounts
+    RENTAL_SUFFIX_MAP = {
+        ('rent', 'USD'): '01', ('rates', 'USD'): '02', ('maintenance', 'USD'): '03',
+        ('parking', 'USD'): '04', ('vat', 'USD'): '05', ('deposit', 'USD'): '06',
+        ('rent', 'ZWG'): '07', ('rates', 'ZWG'): '08', ('maintenance', 'ZWG'): '09',
+        ('parking', 'ZWG'): '10', ('vat', 'ZWG'): '11', ('deposit', 'ZWG'): '12',
+    }
+    LEVY_SUFFIX_MAP = {
+        ('levy', 'USD'): '01', ('special_levy', 'USD'): '02', ('maintenance', 'USD'): '03',
+        ('parking', 'USD'): '04', ('rates', 'USD'): '05',
+        ('levy', 'ZWG'): '06', ('special_levy', 'ZWG'): '07', ('maintenance', 'ZWG'): '08',
+        ('parking', 'ZWG'): '09', ('rates', 'ZWG'): '10',
+    }
+    GENERAL_SUFFIX_MAP = {
+        ('general', 'USD'): '00', ('general', 'ZWG'): '50',
+    }
+
+    code = models.CharField(max_length=20, unique=True, db_index=True)
+    name = models.CharField(max_length=255)
+    entity_type = models.CharField(max_length=20, choices=EntityType.choices)
+    category = models.CharField(
+        max_length=20, choices=AccountCategory.choices,
+        default='general', db_index=True
+    )
+
+    # Polymorphic links — exactly one should be set
+    # Tenants: OneToOne (one account per tenant)
+    tenant = models.OneToOneField(
+        'masterfile.RentalTenant', on_delete=models.CASCADE,
+        null=True, blank=True, related_name='subsidiary_account'
+    )
+    # Landlords: ForeignKey (multiple category-specific accounts per landlord)
+    landlord = models.ForeignKey(
+        'masterfile.Landlord', on_delete=models.CASCADE,
+        null=True, blank=True, related_name='subsidiary_accounts'
+    )
+
+    currency = models.CharField(max_length=3, default='USD')
+    current_balance = models.DecimalField(
+        max_digits=18, decimal_places=2, default=Decimal('0.00')
+    )
+
+    is_active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = 'Subsidiary Account'
+        verbose_name_plural = 'Subsidiary Accounts'
+        ordering = ['code']
+        indexes = [
+            models.Index(fields=['entity_type', 'is_active']),
+        ]
+
+    def __str__(self):
+        return f'{self.code} - {self.name}'
+
+    @classmethod
+    def get_or_create_for_tenant(cls, tenant):
+        """Get or create a subsidiary account for a rental tenant.
+
+        Rental tenants get TN/ prefix; levy tenants get AC/ prefix.
+        """
+        # Determine prefix and entity type based on account type
+        if tenant.account_type == 'levy':
+            prefix = 'AC'
+            entity_type = cls.EntityType.ACCOUNT_HOLDER
+        else:
+            prefix = 'TN'
+            entity_type = cls.EntityType.TENANT
+
+        code = f'{prefix}/{tenant.code.replace("TN", "").lstrip("0") or "0"}'
+
+        account, created = cls.objects.get_or_create(
+            tenant=tenant,
+            defaults={
+                'code': code,
+                'name': tenant.name,
+                'entity_type': entity_type,
+                'currency': 'USD',
+            }
+        )
+        # Fix code format if account was previously created with wrong prefix
+        if tenant.account_type == 'levy' and account.code.startswith('TN/'):
+            account.code = f'AC/{tenant.code.replace("TN", "").lstrip("0") or "0"}'
+            account.entity_type = cls.EntityType.ACCOUNT_HOLDER
+            account.save(update_fields=['code', 'entity_type'])
+        return account
+
+    @classmethod
+    def get_or_create_for_landlord_category(cls, landlord, category='general', currency='USD'):
+        """Get or create a category-specific subsidiary account for a landlord.
+        Uses the correct suffix map based on the landlord's property management type.
+        Rental: max 6 sub-accounts (Rent, Rates, Maintenance, Parking, VAT, Deposit)
+        Levy: max 5 sub-accounts (Levy, Special Levy, Maintenance, Parking, Rates)
+        """
+        # Determine management type from landlord's properties
+        mgmt_type = 'rental'
+        if hasattr(landlord, 'properties'):
+            prop = landlord.properties.first()
+            if prop and prop.management_type == 'levy':
+                mgmt_type = 'levy'
+
+        # Select the right suffix map
+        if category == 'general':
+            suffix_map = cls.GENERAL_SUFFIX_MAP
+        elif mgmt_type == 'levy':
+            suffix_map = cls.LEVY_SUFFIX_MAP
+        else:
+            suffix_map = cls.RENTAL_SUFFIX_MAP
+
+        suffix = suffix_map.get((category, currency), '00')
+        code = f'LD/{landlord.id:05d}/{suffix}'
+
+        # Category display name
+        category_label = dict(cls.AccountCategory.choices).get(
+            category, category.replace('_', ' ').title()
+        )
+        name = f'{landlord.name} - {category_label} ({currency})'
+
+        account, created = cls.objects.get_or_create(
+            code=code,
+            defaults={
+                'name': name,
+                'entity_type': cls.EntityType.LANDLORD,
+                'landlord': landlord,
+                'category': category,
+                'currency': currency,
+            }
+        )
+        return account
+
+    @classmethod
+    def get_or_create_for_landlord(cls, landlord, currency=None):
+        """Get or create a subsidiary account for a landlord.
+
+        Backward-compatible wrapper — delegates to get_or_create_for_landlord_category
+        with category='general'.
+        """
+        if currency is None:
+            currency = getattr(landlord, 'preferred_currency', 'USD') or 'USD'
+        return cls.get_or_create_for_landlord_category(
+            landlord, category='general', currency=currency
+        )
+
+    @classmethod
+    def seed_for_landlord(cls, landlord, management_type='rental'):
+        """Pre-create the full set of category-specific sub-accounts for a landlord.
+
+        Rental: 12 accounts (6 categories × 2 currencies)
+        Levy:   10 accounts (5 categories × 2 currencies)
+
+        Idempotent — uses get_or_create on each (category, currency) pair.
+        Called from the Property post_save signal once we know the management type.
+        """
+        suffix_map = cls.LEVY_SUFFIX_MAP if management_type == 'levy' else cls.RENTAL_SUFFIX_MAP
+        created_accounts = []
+        for (category, currency) in suffix_map.keys():
+            account = cls.get_or_create_for_landlord_category(
+                landlord, category=category, currency=currency
+            )
+            created_accounts.append(account)
+        return created_accounts
+
+
+class SubsidiaryTransaction(models.Model):
+    """
+    Subsidiary Ledger Transaction - Individual entries in a subsidiary account.
+    Each transaction shows the contra account, reference, and running balance.
+
+    Mirrors the statement format from the trust accounting spec:
+    TRANSACTION ID | Date | Contra Acc | Ref | Description | Debit | Credit | Balance
+    """
+    account = models.ForeignKey(
+        SubsidiaryAccount, on_delete=models.CASCADE, related_name='transactions'
+    )
+    transaction_number = models.PositiveIntegerField(db_index=True)
+    date = models.DateField()
+
+    contra_account = models.CharField(
+        max_length=20,
+        help_text='Code of the other side of the entry (e.g., 2300/010, 4000/001, LD/3000)'
+    )
+    reference = models.CharField(
+        max_length=50,
+        help_text='Document reference (INV-xxxxxx, RCT-xxxxxx, CMA-xxxxxx)'
+    )
+    description = models.CharField(max_length=500)
+
+    debit_amount = models.DecimalField(
+        max_digits=18, decimal_places=2, default=Decimal('0.00')
+    )
+    credit_amount = models.DecimalField(
+        max_digits=18, decimal_places=2, default=Decimal('0.00')
+    )
+    balance = models.DecimalField(max_digits=18, decimal_places=2)
+
+    # Link back to GL for cross-referencing
+    journal_entry = models.ForeignKey(
+        JournalEntry, on_delete=models.SET_NULL,
+        null=True, blank=True, related_name='subsidiary_transactions'
+    )
+
+    # Transaction Normalization Engine fields
+    is_reversal = models.BooleanField(default=False)
+    reversed_transaction = models.ForeignKey(
+        'self', on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='reversals',
+        help_text='Points to the original transaction being reversed'
+    )
+    is_consolidated = models.BooleanField(default=False)
+    consolidation_marker = models.CharField(
+        max_length=1, blank=True, default='',
+        help_text="'C' if this is a consolidated result"
+    )
+    overwritten_description = models.CharField(
+        max_length=500, blank=True,
+        help_text='New description if narration was overwritten'
+    )
+
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        verbose_name = 'Subsidiary Transaction'
+        verbose_name_plural = 'Subsidiary Transactions'
+        ordering = ['transaction_number']
+        unique_together = ['account', 'transaction_number']
+        indexes = [
+            models.Index(fields=['account', 'date']),
+            models.Index(fields=['date']),
+            models.Index(fields=['reference']),
+        ]
+
+    def __str__(self):
+        side = f'Dr {self.debit_amount}' if self.debit_amount else f'Cr {self.credit_amount}'
+        return f'{self.transaction_number} - {self.account.code}: {side}'
+
+    @classmethod
+    def get_next_number(cls):
+        """Get the next global transaction number."""
+        last = cls.objects.order_by('-transaction_number').first()
+        return (last.transaction_number + 1) if last else 10001
+
+    @classmethod
+    def create_entry(cls, account, date, contra_account, reference,
+                     description, debit_amount=None, credit_amount=None,
+                     journal_entry=None):
+        """
+        Create a subsidiary transaction and update the account balance.
+        Returns the created transaction.
+        """
+        debit = debit_amount or Decimal('0.00')
+        credit = credit_amount or Decimal('0.00')
+
+        # Update running balance on the account
+        # Tenant accounts: normal balance is DEBIT (they owe money)
+        # Landlord accounts: normal balance is CREDIT (agent owes them)
+        if account.entity_type in ('tenant', 'account_holder'):
+            account.current_balance += debit - credit
+        else:
+            account.current_balance += credit - debit
+
+        account.save(update_fields=['current_balance', 'updated_at'])
+
+        txn_number = cls.get_next_number()
+
+        return cls.objects.create(
+            account=account,
+            transaction_number=txn_number,
+            date=date,
+            contra_account=contra_account,
+            reference=reference,
+            description=description,
+            debit_amount=debit,
+            credit_amount=credit,
+            balance=account.current_balance,
+            journal_entry=journal_entry,
+        )
+
+
+def build_transaction_description(txn_type, payment_method=None, tenant_name=None,
+                                  unit=None, lease=None, user_ref=None):
+    """
+    Build a transaction description in the trust accounting format:
+    {Type}-{Payment Method}-{Tenant Name}-{Unit}-{Lease ID} Ref-{User text}
+
+    The system-generated part cannot be altered. The user-entered part follows "Ref-".
+    """
+    parts = [txn_type]
+    if payment_method:
+        parts.append(payment_method)
+    if tenant_name:
+        parts.append(tenant_name)
+    if unit:
+        unit_label = f'{unit}' if isinstance(unit, str) else f'{unit.property.name}-{unit.unit_number}'
+        parts.append(unit_label)
+    if lease:
+        lease_id = lease if isinstance(lease, str) else f'Lease ID {lease.id}'
+        parts.append(lease_id)
+
+    desc = '-'.join(parts)
+
+    if user_ref:
+        desc += f' Ref-{user_ref}'
+
+    return desc
+
+
+class AccruedExpense(models.Model):
+    """
+    Non-cash expense posting (Layer 2).
+    Handles accrued expenses and depreciation that don't involve cash.
+    """
+    class ExpenseClass(models.TextChoices):
+        CLEARABLE = 'clearable', 'Clearable'  # Will be paid in cash later (salaries, rates, NSSA)
+        NON_CLEARABLE = 'non_clearable', 'Non-Clearable'  # Never paid (depreciation)
+
+    class Status(models.TextChoices):
+        DRAFT = 'draft', 'Draft'
+        POSTED = 'posted', 'Posted'
+        CLEARED = 'cleared', 'Cleared'  # Clearable expense that has been paid
+
+    expense_number = models.CharField(max_length=50, unique=True)
+    date = models.DateField()
+
+    # Expense account (e.g., Salaries & Wages 2000/001, Depreciation 2500/000)
+    expense_account = models.ForeignKey(
+        ChartOfAccount, on_delete=models.PROTECT, related_name='accrued_expenses'
+    )
+
+    # Expense class
+    expense_class = models.CharField(max_length=20, choices=ExpenseClass.choices)
+
+    # Supplier/Payable account (e.g., Accrued Salary Payable, NSSA Payable, Accumulated Depreciation)
+    payable_account = models.ForeignKey(
+        ChartOfAccount, on_delete=models.PROTECT, related_name='accrued_payables'
+    )
+
+    # Category lock (rent, levy, special_levy, etc.)
+    funding_category = models.CharField(
+        max_length=20, choices=SubsidiaryAccount.AccountCategory.choices
+    )
+
+    # Lessor's Accrual sub-account (for clearable expenses)
+    accrual_sub_account = models.ForeignKey(
+        SubsidiaryAccount, on_delete=models.SET_NULL,
+        null=True, blank=True, related_name='accrued_expenses'
+    )
+
+    # Landlord sub-account affected
+    landlord_sub_account = models.ForeignKey(
+        SubsidiaryAccount, on_delete=models.SET_NULL,
+        null=True, blank=True, related_name='accrued_landlord_expenses'
+    )
+
+    # Landlord reference
+    landlord = models.ForeignKey(
+        'masterfile.Landlord', on_delete=models.PROTECT, related_name='accrued_expenses'
+    )
+
+    description = models.CharField(max_length=500)
+    custom_description = models.CharField(max_length=500, blank=True)
+    amount = models.DecimalField(max_digits=18, decimal_places=2)
+    currency = models.CharField(max_length=3, default='USD')
+
+    status = models.CharField(max_length=20, choices=Status.choices, default=Status.DRAFT)
+    journal = models.ForeignKey(Journal, on_delete=models.SET_NULL, null=True, blank=True)
+
+    # For cleared expenses - link to the cash payment that cleared it
+    cleared_by_expense = models.ForeignKey(
+        'billing.Expense', on_delete=models.SET_NULL,
+        null=True, blank=True, related_name='cleared_accruals'
+    )
+    cleared_date = models.DateField(null=True, blank=True)
+
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['-date', '-created_at']
+
+    def __str__(self):
+        return f'{self.expense_number} - {self.description}'
+
+    def save(self, *args, **kwargs):
+        if not self.expense_number:
+            self.expense_number = self._generate_number()
+        super().save(*args, **kwargs)
+
+    def _generate_number(self):
+        from django.utils import timezone
+        prefix = f'ACR{timezone.now().strftime("%Y%m%d")}'
+        last = AccruedExpense.objects.filter(
+            expense_number__startswith=prefix
+        ).order_by('-expense_number').first()
+        num = int(last.expense_number[len(prefix):]) + 1 if last else 1
+        return f'{prefix}{num:04d}'
+
+    @transaction.atomic
+    def post_to_ledger(self, user=None):
+        """Post accrued expense to GL and subsidiary ledgers."""
+        if self.journal:
+            return self.journal
+
+        journal = Journal.objects.create(
+            journal_type=Journal.JournalType.GENERAL,
+            date=self.date,
+            description=self.custom_description or self.description,
+            reference=self.expense_number,
+            currency=self.currency,
+            created_by=user,
+        )
+
+        # GL: Dr Expense Account, Cr Payable Account
+        JournalEntry.objects.create(
+            journal=journal, account=self.expense_account,
+            description=self.custom_description or self.description,
+            debit_amount=self.amount,
+            source_type='accrued_expense', source_id=self.id,
+        )
+        JournalEntry.objects.create(
+            journal=journal, account=self.payable_account,
+            description=self.custom_description or self.description,
+            credit_amount=self.amount,
+            source_type='accrued_expense', source_id=self.id,
+        )
+
+        journal.post(user)
+
+        # Subsidiary: Debit landlord sub-account (reduces what landlord has)
+        if self.landlord_sub_account:
+            SubsidiaryTransaction.create_entry(
+                account=self.landlord_sub_account,
+                date=self.date,
+                contra_account=self.expense_account.code,
+                reference=self.expense_number,
+                description=self.custom_description or self.description,
+                debit_amount=self.amount,
+                journal_entry=journal.entries.filter(debit_amount__gt=0).first(),
+            )
+
+        # For clearable expenses, also record on accrual sub-account
+        if self.expense_class == self.ExpenseClass.CLEARABLE and self.accrual_sub_account:
+            SubsidiaryTransaction.create_entry(
+                account=self.accrual_sub_account,
+                date=self.date,
+                contra_account=self.payable_account.code,
+                reference=self.expense_number,
+                description=self.custom_description or self.description,
+                credit_amount=self.amount,
+                journal_entry=journal.entries.filter(credit_amount__gt=0).first(),
+            )
+
+        self.journal = journal
+        self.status = self.Status.POSTED
+        self.save()
+        return journal
+
+
+class BalanceSheetMovement(models.Model):
+    """
+    Non-cash balance sheet value movements (Layer 3).
+    Pure asset-to-asset, asset-to-liability, liability-to-liability movements.
+    No cash or expense accounts involved.
+    """
+    class Status(models.TextChoices):
+        DRAFT = 'draft', 'Draft'
+        POSTED = 'posted', 'Posted'
+
+    movement_number = models.CharField(max_length=50, unique=True)
+    date = models.DateField()
+
+    # Debit account (asset or liability being increased)
+    debit_account = models.ForeignKey(
+        ChartOfAccount, on_delete=models.PROTECT, related_name='bs_movement_debits'
+    )
+
+    # Credit account (asset or liability being decreased)
+    credit_account = models.ForeignKey(
+        ChartOfAccount, on_delete=models.PROTECT, related_name='bs_movement_credits'
+    )
+
+    # Category lock
+    category = models.CharField(
+        max_length=20, choices=SubsidiaryAccount.AccountCategory.choices
+    )
+
+    # Landlord dimension - every BS movement belongs to a landlord
+    landlord = models.ForeignKey(
+        'masterfile.Landlord', on_delete=models.PROTECT, related_name='bs_movements'
+    )
+    landlord_sub_account = models.ForeignKey(
+        SubsidiaryAccount, on_delete=models.SET_NULL,
+        null=True, blank=True, related_name='bs_movements'
+    )
+
+    description = models.CharField(max_length=500)
+    custom_description = models.CharField(max_length=500, blank=True)
+    amount = models.DecimalField(max_digits=18, decimal_places=2)
+    currency = models.CharField(max_length=3, default='USD')
+
+    status = models.CharField(max_length=20, choices=Status.choices, default=Status.DRAFT)
+    journal = models.ForeignKey(Journal, on_delete=models.SET_NULL, null=True, blank=True)
+
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['-date', '-created_at']
+
+    def __str__(self):
+        return f'{self.movement_number} - {self.description}'
+
+    def save(self, *args, **kwargs):
+        if not self.movement_number:
+            self.movement_number = self._generate_number()
+        super().save(*args, **kwargs)
+
+    def _generate_number(self):
+        from django.utils import timezone
+        prefix = f'BSM{timezone.now().strftime("%Y%m%d")}'
+        last = BalanceSheetMovement.objects.filter(
+            movement_number__startswith=prefix
+        ).order_by('-movement_number').first()
+        num = int(last.movement_number[len(prefix):]) + 1 if last else 1
+        return f'{prefix}{num:04d}'
+
+    @transaction.atomic
+    def post_to_ledger(self, user=None):
+        """Post balance sheet movement to GL."""
+        if self.journal:
+            return self.journal
+
+        journal = Journal.objects.create(
+            journal_type=Journal.JournalType.GENERAL,
+            date=self.date,
+            description=self.custom_description or self.description,
+            reference=self.movement_number,
+            currency=self.currency,
+            created_by=user,
+        )
+
+        # GL: Dr debit_account, Cr credit_account
+        JournalEntry.objects.create(
+            journal=journal, account=self.debit_account,
+            description=self.custom_description or self.description,
+            debit_amount=self.amount,
+            source_type='bs_movement', source_id=self.id,
+        )
+        JournalEntry.objects.create(
+            journal=journal, account=self.credit_account,
+            description=self.custom_description or self.description,
+            credit_amount=self.amount,
+            source_type='bs_movement', source_id=self.id,
+        )
+
+        journal.post(user)
+
+        # Subsidiary: record on landlord sub-account for reporting
+        if self.landlord_sub_account:
+            SubsidiaryTransaction.create_entry(
+                account=self.landlord_sub_account,
+                date=self.date,
+                contra_account=f'{self.debit_account.code}/{self.credit_account.code}',
+                reference=self.movement_number,
+                description=self.custom_description or self.description,
+                debit_amount=self.amount,
+                journal_entry=journal.entries.filter(debit_amount__gt=0).first(),
+            )
+
+        self.journal = journal
+        self.status = self.Status.POSTED
+        self.save()
+        return journal
+
+
+class OpeningBalance(models.Model):
+    """
+    Opening/Takeover balance entries (Layer 4).
+    Introduces pre-existing values when onboarding a new landlord.
+    One side is always the 'Opening Balances' contra account (9000).
+    """
+    class Status(models.TextChoices):
+        DRAFT = 'draft', 'Draft'
+        POSTED = 'posted', 'Posted'
+
+    class EntryDirection(models.TextChoices):
+        DEBIT = 'debit', 'Debit (introduce asset/receivable)'
+        CREDIT = 'credit', 'Credit (introduce liability/prepayment)'
+
+    entry_number = models.CharField(max_length=50, unique=True)
+    date = models.DateField()
+
+    target_account = models.ForeignKey(
+        ChartOfAccount, on_delete=models.PROTECT, related_name='opening_balances'
+    )
+    direction = models.CharField(max_length=10, choices=EntryDirection.choices)
+    category = models.CharField(max_length=20, choices=SubsidiaryAccount.AccountCategory.choices)
+
+    landlord = models.ForeignKey(
+        'masterfile.Landlord', on_delete=models.PROTECT, related_name='opening_balances'
+    )
+    landlord_sub_account = models.ForeignKey(
+        SubsidiaryAccount, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='opening_balances'
+    )
+    tenant_sub_account = models.ForeignKey(
+        SubsidiaryAccount, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='opening_balance_tenant'
+    )
+    # Supplier (creditor) the opening balance is owed TO. Used for the
+    # Apex-Finance-loan / Vendor-payable scenarios from the Opening
+    # Layer spec — surfaces "who the landlord owes" as a dimension on
+    # reports, distinct from the generic target_account.
+    supplier = models.ForeignKey(
+        'masterfile.Supplier', on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='opening_balances',
+        help_text='Optional creditor/supplier this OB is owed to'
+    )
+
+    description = models.CharField(max_length=500, default='Opening balance')
+    custom_description = models.CharField(max_length=500, blank=True)
+    amount = models.DecimalField(max_digits=18, decimal_places=2)
+    currency = models.CharField(max_length=3, default='USD')
+
+    status = models.CharField(max_length=20, choices=Status.choices, default=Status.DRAFT)
+    journal = models.ForeignKey(Journal, on_delete=models.SET_NULL, null=True, blank=True)
+
+    created_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['-date', '-created_at']
+
+    def __str__(self):
+        return f'{self.entry_number} - {self.custom_description or self.description}'
+
+    def save(self, *args, **kwargs):
+        if not self.entry_number:
+            self.entry_number = self._generate_number()
+        super().save(*args, **kwargs)
+
+    def _generate_number(self):
+        from django.utils import timezone
+        prefix = f'OPB{timezone.now().strftime("%Y%m%d")}'
+        last = OpeningBalance.objects.filter(
+            entry_number__startswith=prefix
+        ).order_by('-entry_number').first()
+        num = int(last.entry_number[len(prefix):]) + 1 if last else 1
+        return f'{prefix}{num:04d}'
+
+    @transaction.atomic
+    def post_to_ledger(self, user=None):
+        """Post opening balance to GL and subsidiary ledgers."""
+        if self.journal:
+            return self.journal
+
+        opening_account, _ = ChartOfAccount.objects.get_or_create(
+            code='9000',
+            defaults={
+                'name': 'Opening Balances',
+                'account_type': 'equity',
+                'account_subtype': 'retained_earnings',
+                'is_system': True,
+            }
+        )
+
+        desc = self.custom_description or self.description
+
+        journal = Journal.objects.create(
+            journal_type=Journal.JournalType.GENERAL,
+            date=self.date, description=desc,
+            reference=self.entry_number, currency=self.currency,
+            created_by=user,
+        )
+
+        if self.direction == self.EntryDirection.DEBIT:
+            je_target = JournalEntry.objects.create(
+                journal=journal, account=self.target_account,
+                description=desc, debit_amount=self.amount,
+                source_type='opening_balance', source_id=self.id,
+            )
+            JournalEntry.objects.create(
+                journal=journal, account=opening_account,
+                description=desc, credit_amount=self.amount,
+                source_type='opening_balance', source_id=self.id,
+            )
+        else:
+            JournalEntry.objects.create(
+                journal=journal, account=opening_account,
+                description=desc, debit_amount=self.amount,
+                source_type='opening_balance', source_id=self.id,
+            )
+            je_target = JournalEntry.objects.create(
+                journal=journal, account=self.target_account,
+                description=desc, credit_amount=self.amount,
+                source_type='opening_balance', source_id=self.id,
+            )
+
+        journal.post(user)
+
+        # Subsidiary: landlord sub-account
+        if self.landlord_sub_account:
+            kwargs = {'account': self.landlord_sub_account, 'date': self.date,
+                      'contra_account': '9000', 'reference': self.entry_number,
+                      'description': desc, 'journal_entry': je_target}
+            if self.direction == self.EntryDirection.DEBIT:
+                kwargs['debit_amount'] = self.amount
+            else:
+                kwargs['credit_amount'] = self.amount
+            SubsidiaryTransaction.create_entry(**kwargs)
+
+        # Subsidiary: tenant sub-account (arrears or prepayment)
+        if self.tenant_sub_account:
+            kwargs = {'account': self.tenant_sub_account, 'date': self.date,
+                      'contra_account': '9000', 'reference': self.entry_number,
+                      'description': desc, 'journal_entry': je_target}
+            if self.direction == self.EntryDirection.DEBIT:
+                kwargs['debit_amount'] = self.amount
+            else:
+                kwargs['credit_amount'] = self.amount
+            SubsidiaryTransaction.create_entry(**kwargs)
+
+        self.journal = journal
+        self.status = self.Status.POSTED
+        self.save()
+        return journal
+
+
+class TransactionConsolidation(models.Model):
+    """
+    Transaction Normalization Engine.
+    Consolidates original transactions with their reversals into clean single entries.
+    The underlying transactions are preserved for audit but hidden in consolidated view.
+    """
+    # The consolidated/merged view transaction
+    consolidated_entry = models.OneToOneField(
+        SubsidiaryTransaction, on_delete=models.CASCADE,
+        related_name='consolidation', null=True, blank=True,
+        help_text='The visible merged transaction (created by consolidation)'
+    )
+
+    # The original transactions being merged (hidden in consolidated view)
+    source_transactions = models.ManyToManyField(
+        SubsidiaryTransaction, related_name='consolidated_into',
+        help_text='Original transactions that were merged'
+    )
+
+    # Which subsidiary account this consolidation belongs to
+    account = models.ForeignKey(
+        SubsidiaryAccount, on_delete=models.CASCADE,
+        related_name='consolidations'
+    )
+
+    # Metadata
+    reason = models.CharField(max_length=500, blank=True)
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['-created_at']
+
+    def __str__(self):
+        return f'Consolidation on {self.account.code} ({self.source_transactions.count()} txns)'

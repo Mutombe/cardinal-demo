@@ -1,0 +1,895 @@
+import { motion } from 'framer-motion'
+import { useQuery, keepPreviousData } from '@tanstack/react-query'
+import {
+  Building2,
+  Home,
+  Users,
+  DollarSign,
+  TrendingUp,
+  TrendingDown,
+  AlertTriangle,
+  Calendar,
+  Wallet,
+  Receipt,
+  PiggyBank,
+  Activity,
+  ChevronRight,
+  Clock,
+  Zap,
+  CheckCircle2,
+  FileText,
+  UserPlus,
+  CreditCard,
+  ArrowRight,
+  Layers,
+  Download,
+  Banknote,
+} from 'lucide-react'
+import {
+  AreaChart,
+  Area,
+  XAxis,
+  YAxis,
+  CartesianGrid,
+  Tooltip,
+  ResponsiveContainer,
+  PieChart,
+  Pie,
+  Cell,
+} from 'recharts'
+import { reportsApi, subsidiaryApi } from '../services/api'
+import { formatCurrency, formatPercent, formatDate, formatDistanceToNow, cn } from '../lib/utils'
+import { useNavigate, useSearchParams } from 'react-router-dom'
+import { OnboardingChecklist } from '../components/dashboard/OnboardingChecklist'
+import { PiUsersFour } from "react-icons/pi";
+import { TbUserSquareRounded } from "react-icons/tb";
+import { LiaUsersSolid } from "react-icons/lia";
+import { PiBuildingApartmentLight } from "react-icons/pi";
+import { Tooltip as UITooltip } from '../components/ui'
+
+const container = {
+  hidden: { opacity: 0 },
+  show: {
+    opacity: 1,
+    transition: { staggerChildren: 0.05 }
+  }
+}
+
+const item = {
+  hidden: { opacity: 0, y: 20 },
+  show: { opacity: 1, y: 0 }
+}
+
+interface StatCardProps {
+  title: string
+  value: string | number
+  subtitle?: string
+  icon: React.ElementType
+  color: 'blue' | 'green' | 'purple' | 'orange' | 'red' | 'cyan'
+  isLoading?: boolean
+  href?: string
+  tooltip?: string
+}
+
+const colorConfig = {
+  blue: { bg: 'bg-primary-50', icon: 'bg-primary-700', text: 'text-primary-700' },
+  green: { bg: 'bg-emerald-50', icon: 'bg-emerald-500', text: 'text-emerald-600' },
+  purple: { bg: 'bg-purple-50', icon: 'bg-purple-500', text: 'text-purple-600' },
+  orange: { bg: 'bg-orange-50', icon: 'bg-orange-500', text: 'text-orange-600' },
+  red: { bg: 'bg-red-50', icon: 'bg-red-500', text: 'text-red-600' },
+  cyan: { bg: 'bg-cyan-50', icon: 'bg-cyan-500', text: 'text-cyan-600' },
+}
+
+function StatCard({ title, value, subtitle, icon: Icon, color, isLoading, href, tooltip }: StatCardProps) {
+  const navigate = useNavigate()
+  const colors = colorConfig[color]
+
+  return (
+    <motion.div
+      variants={item}
+      whileHover={{ y: -1 }}
+      transition={{ type: 'spring', stiffness: 300, damping: 20 }}
+      onClick={href ? () => navigate(href) : undefined}
+      className={cn(
+        "bg-white rounded-xl border border-gray-200 p-4 md:p-6 hover:shadow-md hover:border-gray-300 transition-[box-shadow,border-color] duration-300",
+        href && "cursor-pointer"
+      )}
+    >
+      <div className="flex items-start justify-between">
+        <div className={cn('p-2 md:p-3 rounded-xl', colors.bg)}>
+          <div className={cn('p-1.5 md:p-2 rounded-lg', colors.icon)}>
+            <Icon className="w-4 h-4 md:w-5 md:h-5 text-white" />
+          </div>
+        </div>
+      </div>
+      <div className="mt-3 md:mt-4">
+        {isLoading ? (
+          <div className="h-8 md:h-9 w-20 md:w-24 bg-gray-200 rounded animate-pulse" />
+        ) : (
+          <h3 className="text-2xl md:text-3xl font-bold text-gray-900 tabular-nums">{value}</h3>
+        )}
+        {tooltip ? (
+          <UITooltip content={tooltip}>
+            <span><p className="text-xs md:text-sm text-gray-500 mt-1">{title}</p></span>
+          </UITooltip>
+        ) : (
+          <p className="text-xs md:text-sm text-gray-500 mt-1">{title}</p>
+        )}
+        {isLoading ? (
+          <div className="h-3 md:h-4 w-16 md:w-20 bg-gray-200 rounded animate-pulse mt-1" />
+        ) : subtitle ? (
+          <p className="text-xs text-gray-500 mt-1">{subtitle}</p>
+        ) : null}
+      </div>
+    </motion.div>
+  )
+}
+
+export default function Dashboard() {
+  const navigate = useNavigate()
+  const [searchParams] = useSearchParams()
+
+  const { data: stats, isLoading } = useQuery({
+    queryKey: ['dashboard-stats'],
+    queryFn: () => reportsApi.dashboard().then(r => r.data),
+    staleTime: 60 * 1000, // 60 seconds — live-updating stats
+    refetchInterval: 60 * 1000, // Auto-refresh every 60 seconds,
+    placeholderData: keepPreviousData,
+  })
+
+  // Subsidiary accounts for financial overview
+  const { data: landlordSubAccounts, isLoading: loadingSubAccounts } = useQuery({
+    queryKey: ['dashboard-landlord-sub-accounts'],
+    queryFn: () => subsidiaryApi.list({ entity_type: 'landlord' }).then((r) => r.data),
+    staleTime: 60 * 1000,
+    placeholderData: keepPreviousData,
+  })
+
+  const { data: tenantSubAccounts, isLoading: loadingTenantSubAccounts } = useQuery({
+    queryKey: ['dashboard-tenant-sub-accounts'],
+    queryFn: () => subsidiaryApi.list({ entity_type: 'tenant' }).then((r) => r.data),
+    staleTime: 60 * 1000,
+    placeholderData: keepPreviousData,
+  })
+
+  // Normalize list responses
+  const normList = (data: any) => {
+    if (!data) return []
+    if (Array.isArray(data)) return data
+    if (data.results && Array.isArray(data.results)) return data.results
+    return []
+  }
+
+  // Compute financial overview KPIs from subsidiary accounts
+  const landlordAccounts = normList(landlordSubAccounts)
+  const tenantAccounts = normList(tenantSubAccounts)
+
+  const parseBal = (acc: any) => {
+    const raw = acc.current_balance ?? acc.balance ?? 0
+    const num = Number(raw)
+    return isNaN(num) ? 0 : num
+  }
+
+  const totalTrustLiability = landlordAccounts.reduce(
+    (sum: number, acc: any) => sum + parseBal(acc), 0
+  )
+  const totalTenantReceivables = tenantAccounts.reduce(
+    (sum: number, acc: any) => sum + parseBal(acc), 0
+  )
+
+  // Group landlord accounts by landlord for summary table
+  const landlordSummary = (() => {
+    const byLandlord: Record<string, { id: number; name: string; categories: Record<string, number>; total: number }> = {}
+    landlordAccounts.forEach((acc: any) => {
+      const lid = acc.landlord_id || acc.landlord || acc.entity_id || 0
+      const lname = acc.landlord_name || acc.entity_name || 'Unknown'
+      if (!byLandlord[lid]) {
+        byLandlord[lid] = { id: lid, name: lname, categories: {}, total: 0 }
+      }
+      const rawCat = acc.category || 'general'
+      const cat = rawCat.replace(/_/g, ' ').replace(/\b\w/g, (c: string) => c.toUpperCase())
+      const bal = parseBal(acc)
+      byLandlord[lid].categories[cat] = (byLandlord[lid].categories[cat] || 0) + bal
+      byLandlord[lid].total += bal
+    })
+    return Object.values(byLandlord)
+  })()
+
+  // Collect all unique categories across landlords
+  const allCategories = (() => {
+    const cats = new Set<string>()
+    landlordSummary.forEach((l) => Object.keys(l.categories).forEach((c) => cats.add(c)))
+    return Array.from(cats).sort()
+  })()
+
+  const occupancyRate = stats?.properties?.occupancy_rate || 0
+  const collectionRate = stats?.financial?.collection_rate || 0
+
+  const overdueInvoices = stats?.alerts?.overdue_invoices || 0
+
+  const kpis = [
+    {
+      title: 'Total Properties',
+      value: stats?.properties?.total || 0,
+      subtitle: `${stats?.properties?.units || 0} total units`,
+      icon: PiBuildingApartmentLight,
+      color: 'blue' as const,
+      href: '/dashboard/properties',
+      tooltip: 'Total managed properties in your portfolio',
+    },
+    {
+      title: 'Occupancy Rate',
+      value: formatPercent(occupancyRate),
+      subtitle: `${stats?.properties?.units - stats?.properties?.vacant || 0} of ${stats?.properties?.units || 0} occupied`,
+      icon: Home,
+      color: occupancyRate >= 90 ? 'green' as const : occupancyRate >= 70 ? 'orange' as const : 'red' as const,
+      href: '/dashboard/units',
+      tooltip: 'Percentage of units currently leased',
+    },
+    {
+      title: 'Monthly Revenue',
+      value: formatCurrency(stats?.monthly?.invoiced || 0),
+      subtitle: `${formatCurrency(stats?.monthly?.collected || 0)} collected (${formatPercent(collectionRate)})`,
+      icon: Wallet,
+      color: 'purple' as const,
+      href: '/dashboard/invoices',
+      tooltip: 'Total invoiced amount this month',
+    },
+    {
+      title: 'Outstanding',
+      value: formatCurrency(stats?.financial?.outstanding || 0),
+      subtitle: `${overdueInvoices} overdue invoice${overdueInvoices !== 1 ? 's' : ''} (${formatCurrency(stats?.alerts?.overdue_amount || 0)})`,
+      icon: Receipt,
+      color: 'orange' as const,
+      href: '/dashboard/reports/aged-analysis',
+      tooltip: 'Total unpaid balance across all tenants',
+    },
+  ]
+
+  const pieData = [
+    { name: 'Occupied', value: stats?.properties?.units - stats?.properties?.vacant || 0, color: '#10b981' },
+    { name: 'Vacant', value: stats?.properties?.vacant || 0, color: '#f43f5e' },
+  ]
+
+  const revenueData = stats?.revenue_trend?.length
+    ? stats.revenue_trend
+    : []
+
+  const quickActions = [
+    { label: 'New Invoice', href: '/dashboard/invoices?action=create', icon: Receipt },
+    { label: 'Record Receipt', href: '/dashboard/receipts?action=create', icon: DollarSign },
+    { label: 'Add Tenant', href: '/dashboard/tenants?action=create', icon: LiaUsersSolid },
+    { label: 'View Reports', href: '/dashboard/reports', icon: Activity },
+  ]
+
+  return (
+    <div className="space-y-8">
+      {/* Header */}
+      <motion.div
+        initial={{ opacity: 0, y: -10 }}
+        animate={{ opacity: 1, y: 0 }}
+        className="flex flex-col sm:flex-row sm:items-start sm:justify-between gap-2"
+      >
+        <div>
+          <h1 className="text-xl md:text-2xl font-bold text-gray-900">Dashboard</h1>
+          <p className="text-sm md:text-base text-gray-500 mt-1">
+            Welcome back! Here's your property overview for{' '}
+            <span className="font-medium text-gray-700">
+              {formatDate(new Date())}
+            </span>
+          </p>
+        </div>
+        <div className="hidden sm:flex items-center gap-2 text-sm text-gray-500">
+          <Clock className="w-4 h-4" />
+          Last updated: {new Date().toLocaleTimeString()}
+        </div>
+      </motion.div>
+
+      {/* Onboarding Checklist - shown for new tenants */}
+      {!isLoading && stats && <OnboardingChecklist stats={stats} />}
+
+      {/* KPI Cards (4 cards) */}
+      <motion.div
+        variants={container}
+        initial="hidden"
+        animate="show"
+        className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6"
+      >
+        {kpis.map((kpi) => (
+          <StatCard key={kpi.title} {...kpi} isLoading={isLoading} />
+        ))}
+      </motion.div>
+
+      {/* Quick Actions - compact horizontal row */}
+      <motion.div
+        initial={{ opacity: 0, y: 10 }}
+        animate={{ opacity: 1, y: 0 }}
+        transition={{ delay: 0.1 }}
+        className="flex gap-3 flex-wrap"
+      >
+        {quickActions.map((action) => (
+          <button
+            key={action.label}
+            onClick={() => navigate(action.href)}
+            className="flex items-center gap-2 px-4 py-2 text-sm font-medium text-gray-700 border border-gray-300 rounded-lg hover:bg-gray-50 hover:border-gray-400 transition-colors"
+          >
+            <action.icon className="w-4 h-4 text-gray-500" />
+            {action.label}
+          </button>
+        ))}
+      </motion.div>
+
+      {/* ===== TRUST ACCOUNT SUMMARY SECTION ===== */}
+      <motion.div
+        initial={{ opacity: 0, y: 20 }}
+        animate={{ opacity: 1, y: 0 }}
+        transition={{ delay: 0.15 }}
+        className="space-y-6"
+      >
+        <div className="flex items-center justify-between">
+          <div>
+            <h2 className="text-lg font-semibold text-gray-900">Trust Account Summary</h2>
+            <p className="text-sm text-gray-500">Subsidiary account balances across all landlords</p>
+          </div>
+          <button
+            onClick={() => navigate('/dashboard/subsidiary-ledger')}
+            className="text-sm text-primary-600 hover:text-primary-700 font-medium flex items-center gap-1"
+          >
+            View Full Ledger <ArrowRight className="w-3.5 h-3.5" />
+          </button>
+        </div>
+
+        {/* Financial KPI Cards */}
+        <motion.div
+          variants={container}
+          initial="hidden"
+          animate="show"
+          className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6"
+        >
+          <StatCard
+            title="Total Trust Liability"
+            value={formatCurrency(totalTrustLiability)}
+            subtitle={`${landlordAccounts.length} sub-accounts`}
+            icon={Banknote}
+            color="blue"
+            isLoading={loadingSubAccounts}
+            tooltip="Sum of all landlord sub-account balances (what we owe landlords)"
+          />
+          <StatCard
+            title="Tenant Receivables"
+            value={formatCurrency(totalTenantReceivables)}
+            subtitle={`${tenantAccounts.length} sub-accounts`}
+            icon={Receipt}
+            color="orange"
+            isLoading={loadingTenantSubAccounts}
+            tooltip="Sum of all tenant sub-account balances (what tenants owe us)"
+          />
+          <StatCard
+            title="Commission Earned (MTD)"
+            value={formatCurrency(stats?.monthly?.commission || stats?.financial?.commission_mtd || 0)}
+            subtitle="This month"
+            icon={TrendingUp}
+            color="purple"
+            isLoading={isLoading}
+            tooltip="Month-to-date commission revenue"
+          />
+          <StatCard
+            title="Net Cash Position"
+            value={formatCurrency(stats?.financial?.bank_balance || stats?.financial?.cash_position || 0)}
+            subtitle="Total bank balances"
+            icon={Wallet}
+            color="green"
+            isLoading={isLoading}
+            tooltip="Total cash available across all bank accounts"
+          />
+        </motion.div>
+
+        {/* Landlord Balance Summary Table */}
+        <motion.div
+          initial={{ opacity: 0, y: 20 }}
+          animate={{ opacity: 1, y: 0 }}
+          transition={{ delay: 0.2 }}
+          className="bg-white rounded-xl border border-gray-200 overflow-hidden hover:shadow-lg transition-shadow duration-300"
+        >
+          <div className="p-6 border-b border-gray-100 flex items-center justify-between">
+            <div>
+              <h3 className="text-lg font-semibold text-gray-900">Landlord Balance Summary</h3>
+              <p className="text-sm text-gray-500">Total balance by landlord across all sub-account categories</p>
+            </div>
+            <button
+              onClick={() => {
+                const csvRows = [
+                  ['Landlord', ...allCategories, 'Total'].join(','),
+                  ...landlordSummary.map((l) =>
+                    [
+                      `"${l.name}"`,
+                      ...allCategories.map((c) => l.categories[c] || 0),
+                      l.total,
+                    ].join(',')
+                  ),
+                ].join('\n')
+                const blob = new Blob([csvRows], { type: 'text/csv' })
+                const url = URL.createObjectURL(blob)
+                const a = document.createElement('a')
+                a.href = url
+                a.download = 'landlord-balance-summary.csv'
+                a.click()
+                URL.revokeObjectURL(url)
+              }}
+              className="flex items-center gap-1.5 px-3 py-1.5 text-sm font-medium text-gray-600 border border-gray-200 rounded-lg hover:bg-gray-50 transition-colors"
+            >
+              <Download className="w-3.5 h-3.5" />
+              Download
+            </button>
+          </div>
+          <div className="overflow-x-auto">
+            {loadingSubAccounts ? (
+              <div className="p-6">
+                <div className="space-y-3">
+                  {[1, 2, 3, 4, 5].map((i) => (
+                    <div key={i} className="flex gap-4 animate-pulse">
+                      <div className="h-4 flex-[2] bg-gray-200 rounded" />
+                      <div className="h-4 flex-1 bg-gray-200 rounded" />
+                      <div className="h-4 flex-1 bg-gray-200 rounded" />
+                      <div className="h-4 flex-1 bg-gray-200 rounded" />
+                    </div>
+                  ))}
+                </div>
+              </div>
+            ) : landlordSummary.length === 0 ? (
+              <div className="p-12 text-center text-sm text-gray-400">
+                <Layers className="w-8 h-8 mx-auto mb-2 opacity-50" />
+                No subsidiary account data available
+              </div>
+            ) : (
+              <table className="w-full">
+                <thead>
+                  <tr className="bg-gray-50">
+                    <th className="text-left text-xs font-medium text-gray-500 uppercase tracking-wider px-6 py-3">Landlord</th>
+                    {allCategories.map((cat) => (
+                      <th key={cat} className="text-right text-xs font-medium text-gray-500 uppercase tracking-wider px-6 py-3">{cat}</th>
+                    ))}
+                    <th className="text-right text-xs font-medium text-gray-500 uppercase tracking-wider px-6 py-3 bg-gray-100">Total</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-gray-100">
+                  {landlordSummary.map((ll) => (
+                    <tr key={ll.id} className="hover:bg-gray-50 transition-colors">
+                      <td className="px-6 py-4 text-sm font-medium">
+                        <button
+                          onClick={() => navigate(`/dashboard/landlords/${ll.id}`)}
+                          className="text-primary-600 hover:text-primary-700 hover:underline"
+                        >
+                          {ll.name}
+                        </button>
+                      </td>
+                      {allCategories.map((cat) => {
+                        const val = ll.categories[cat] || 0
+                        return (
+                          <td key={cat} className="px-6 py-4 text-sm text-right tabular-nums">
+                            {val !== 0 ? (
+                              <button
+                                onClick={() => {
+                                  // Navigate to landlord detail sub-accounts tab
+                                  navigate(`/dashboard/landlords/${ll.id}`)
+                                }}
+                                className={cn(
+                                  'hover:underline',
+                                  val > 0 ? 'text-emerald-600' : 'text-red-600'
+                                )}
+                              >
+                                {formatCurrency(val)}
+                              </button>
+                            ) : (
+                              <span className="text-gray-300">-</span>
+                            )}
+                          </td>
+                        )
+                      })}
+                      <td className="px-6 py-4 text-sm font-bold text-right tabular-nums bg-gray-50">
+                        <span className={ll.total > 0 ? 'text-emerald-600' : ll.total < 0 ? 'text-red-600' : 'text-gray-900'}>
+                          {formatCurrency(ll.total)}
+                        </span>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+                <tfoot>
+                  <tr className="bg-gray-100 border-t-2 border-gray-300">
+                    <td className="px-6 py-3 text-sm font-bold text-gray-900">Total</td>
+                    {allCategories.map((cat) => {
+                      const catTotal = landlordSummary.reduce((sum, ll) => sum + (ll.categories[cat] || 0), 0)
+                      return (
+                        <td key={cat} className="px-6 py-3 text-sm font-bold text-right tabular-nums">
+                          <span className={catTotal > 0 ? 'text-emerald-600' : catTotal < 0 ? 'text-red-600' : 'text-gray-900'}>
+                            {catTotal !== 0 ? formatCurrency(catTotal) : '-'}
+                          </span>
+                        </td>
+                      )
+                    })}
+                    <td className="px-6 py-3 text-sm font-bold text-right tabular-nums">
+                      <span className={totalTrustLiability > 0 ? 'text-emerald-600' : totalTrustLiability < 0 ? 'text-red-600' : 'text-gray-900'}>
+                        {formatCurrency(totalTrustLiability)}
+                      </span>
+                    </td>
+                  </tr>
+                </tfoot>
+              </table>
+            )}
+          </div>
+        </motion.div>
+      </motion.div>
+
+      {/* Month Summary Banner */}
+      {!isLoading && stats && (
+        <motion.div
+          initial={{ opacity: 0, y: -5 }}
+          animate={{ opacity: 1, y: 0 }}
+          transition={{ delay: 0.25 }}
+          className="bg-gradient-to-r from-primary-600 to-primary-700 rounded-xl p-4 md:p-5 text-white"
+        >
+          <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-3">
+            <div className="flex items-center gap-3">
+              <div className="p-2 bg-white/15 rounded-lg">
+                <Zap className="w-5 h-5" />
+              </div>
+              <div>
+                <h2 className="text-sm font-medium text-white/80">
+                  {new Date().toLocaleString('en-US', { month: 'long', year: 'numeric' })} Summary
+                </h2>
+                <p className="text-base md:text-lg font-semibold">
+                  {stats?.monthly?.paid_invoices || 0} of {stats?.monthly?.total_invoices || 0} invoices paid
+                  {stats?.financial?.outstanding > 0 && (
+                    <span className="text-white/80 font-normal"> &middot; {formatCurrency(stats.financial.outstanding)} outstanding</span>
+                  )}
+                </p>
+              </div>
+            </div>
+            <div className="flex items-center gap-4 text-sm">
+              <div className="text-center">
+                <p className="text-white/70 text-xs">Collected</p>
+                <p className="font-bold">{formatCurrency(stats?.monthly?.collected || 0)}</p>
+              </div>
+              <div className="w-px h-8 bg-white/20" />
+              <div className="text-center">
+                <p className="text-white/70 text-xs">Invoiced</p>
+                <p className="font-bold">{formatCurrency(stats?.monthly?.invoiced || 0)}</p>
+              </div>
+              <div className="w-px h-8 bg-white/20" />
+              <div className="text-center">
+                <p className="text-white/70 text-xs">Collection Rate</p>
+                <p className="font-bold">{formatPercent(collectionRate)}</p>
+              </div>
+            </div>
+          </div>
+        </motion.div>
+      )}
+
+      {/* Charts Row: Revenue trend (2/3) + Occupancy donut (1/3) */}
+      <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+        {/* Revenue Chart */}
+        <motion.div
+          initial={{ opacity: 0, y: 20 }}
+          animate={{ opacity: 1, y: 0 }}
+          transition={{ delay: 0.3 }}
+          whileHover={{ y: -1, transition: { type: 'spring', stiffness: 300, damping: 20 } }}
+          className="bg-white rounded-xl border border-gray-200 p-4 md:p-6 lg:col-span-2 hover:shadow-md transition-shadow duration-300"
+        >
+          <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 mb-4 md:mb-6">
+            <div>
+              <h3 className="text-base md:text-lg font-semibold text-gray-900">Revenue Overview</h3>
+              <p className="text-xs md:text-sm text-gray-500">Invoiced vs Collected amounts</p>
+            </div>
+            <div className="flex items-center gap-3 md:gap-4 text-xs md:text-sm">
+              <div className="flex items-center gap-1.5 md:gap-2">
+                <div className="w-2.5 h-2.5 md:w-3 md:h-3 rounded-full bg-blue-500" />
+                <span className="text-gray-600">Invoiced</span>
+              </div>
+              <div className="flex items-center gap-1.5 md:gap-2">
+                <div className="w-2.5 h-2.5 md:w-3 md:h-3 rounded-full bg-emerald-500" />
+                <span className="text-gray-600">Collected</span>
+              </div>
+            </div>
+          </div>
+          <div className="h-56 md:h-72">
+            {isLoading || !revenueData.length ? (
+              <div className="w-full h-full flex flex-col justify-end gap-2 px-4 pb-4">
+                <div className="flex items-end gap-3 h-full">
+                  {[40, 55, 65, 50, 70, 60, 75].map((h, i) => (
+                    <div key={i} className="flex-1 flex flex-col gap-1 justify-end h-full">
+                      <div
+                        className="w-full bg-gray-200 rounded-t animate-pulse"
+                        style={{ height: `${h}%` }}
+                      />
+                    </div>
+                  ))}
+                </div>
+                <div className="flex justify-between">
+                  {[1, 2, 3, 4, 5, 6, 7].map((i) => (
+                    <div key={i} className="h-3 w-8 bg-gray-200 rounded animate-pulse" />
+                  ))}
+                </div>
+              </div>
+            ) : (
+              <ResponsiveContainer width="100%" height="100%">
+                <AreaChart data={revenueData}>
+                  <defs>
+                    <linearGradient id="invoicedGradient" x1="0" y1="0" x2="0" y2="1">
+                      <stop offset="5%" stopColor="#75191b" stopOpacity={0.2}/>
+                      <stop offset="95%" stopColor="#75191b" stopOpacity={0}/>
+                    </linearGradient>
+                    <linearGradient id="collectedGradient" x1="0" y1="0" x2="0" y2="1">
+                      <stop offset="5%" stopColor="#10b981" stopOpacity={0.2}/>
+                      <stop offset="95%" stopColor="#10b981" stopOpacity={0}/>
+                    </linearGradient>
+                  </defs>
+                  <CartesianGrid strokeDasharray="3 3" stroke="#f1f5f9" vertical={false} />
+                  <XAxis dataKey="month" stroke="#94a3b8" fontSize={12} tickLine={false} axisLine={false} />
+                  <YAxis stroke="#94a3b8" fontSize={12} tickLine={false} axisLine={false} tickFormatter={(v) => `${(v/1000).toFixed(0)}k`} />
+                  <Tooltip
+                    formatter={(value: number) => formatCurrency(value)}
+                    contentStyle={{
+                      borderRadius: '12px',
+                      border: '1px solid #e2e8f0',
+                      boxShadow: '0 4px 6px -1px rgb(0 0 0 / 0.1)'
+                    }}
+                  />
+                  <Area
+                    type="monotone"
+                    dataKey="invoiced"
+                    stroke="#75191b"
+                    strokeWidth={2}
+                    fill="url(#invoicedGradient)"
+                    name="Invoiced"
+                  />
+                  <Area
+                    type="monotone"
+                    dataKey="collected"
+                    stroke="#10b981"
+                    strokeWidth={2}
+                    fill="url(#collectedGradient)"
+                    name="Collected"
+                  />
+                </AreaChart>
+              </ResponsiveContainer>
+            )}
+          </div>
+        </motion.div>
+
+        {/* Occupancy Pie Chart */}
+        <motion.div
+          initial={{ opacity: 0, y: 20 }}
+          animate={{ opacity: 1, y: 0 }}
+          transition={{ delay: 0.35 }}
+          whileHover={{ y: -1, transition: { type: 'spring', stiffness: 300, damping: 20 } }}
+          className="bg-white rounded-xl border border-gray-200 p-6 hover:shadow-md transition-shadow duration-300"
+        >
+          <div className="mb-4">
+            <h3 className="text-lg font-semibold text-gray-900">Unit Occupancy</h3>
+            <p className="text-sm text-gray-500">Current status breakdown</p>
+          </div>
+          <div className="h-48 relative">
+            <ResponsiveContainer width="100%" height="100%">
+              <PieChart>
+                <Pie
+                  data={pieData}
+                  innerRadius={55}
+                  outerRadius={75}
+                  paddingAngle={4}
+                  dataKey="value"
+                >
+                  {pieData.map((entry, index) => (
+                    <Cell key={`cell-${index}`} fill={entry.color} />
+                  ))}
+                </Pie>
+                <Tooltip
+                  formatter={(value: number, name: string) => [
+                    `${value} unit${value !== 1 ? 's' : ''} (${stats?.properties?.units ? ((value / stats.properties.units) * 100).toFixed(1) : 0}%)`,
+                    name
+                  ]}
+                  contentStyle={{
+                    borderRadius: '12px',
+                    border: '1px solid #e2e8f0',
+                    boxShadow: '0 4px 6px -1px rgb(0 0 0 / 0.1)',
+                    fontSize: '13px',
+                  }}
+                />
+              </PieChart>
+            </ResponsiveContainer>
+            <div className="absolute inset-0 flex items-center justify-center">
+              <div className="text-center">
+                {isLoading ? (
+                  <div className="h-9 w-16 bg-gray-200 rounded animate-pulse mx-auto" />
+                ) : (
+                  <p className="text-3xl font-bold text-gray-900" title={`${stats?.properties?.units - stats?.properties?.vacant || 0} of ${stats?.properties?.units || 0} units occupied`}>{formatPercent(occupancyRate)}</p>
+                )}
+                <p className="text-xs text-gray-500">Occupied</p>
+              </div>
+            </div>
+          </div>
+          <div className="flex justify-center gap-6 mt-4">
+            {pieData.map((entry) => (
+              <div key={entry.name} className="flex items-center gap-2">
+                <div className="w-3 h-3 rounded-full" style={{ backgroundColor: entry.color }} />
+                <span className="text-sm text-gray-600">{entry.name}</span>
+                {isLoading ? (
+                  <div className="h-4 w-6 bg-gray-200 rounded animate-pulse" />
+                ) : (
+                  <span className="text-sm font-semibold text-gray-900">{entry.value}</span>
+                )}
+              </div>
+            ))}
+          </div>
+        </motion.div>
+      </div>
+
+      {/* Action Required Section */}
+      {!isLoading && stats && ((stats?.alerts?.overdue_invoices || 0) > 0 || (stats?.alerts?.expiring_leases || 0) > 0) && (
+        <motion.div
+          initial={{ opacity: 0, y: -5 }}
+          animate={{ opacity: 1, y: 0 }}
+          transition={{ delay: 0.4 }}
+          className="bg-white rounded-xl border border-red-200 p-5"
+        >
+          <h3 className="text-base font-semibold text-gray-900 mb-3 flex items-center gap-2">
+            <AlertTriangle className="w-4 h-4 text-red-500" />
+            Action Required
+          </h3>
+          <div className="space-y-2">
+            {(stats?.alerts?.overdue_invoices || 0) > 0 && (
+              <button
+                onClick={() => navigate('/dashboard/invoices?status=overdue')}
+                className="w-full flex items-center justify-between p-3 bg-red-50 hover:bg-red-100 rounded-lg transition-colors group"
+              >
+                <div className="flex items-center gap-2">
+                  <Receipt className="w-4 h-4 text-red-600" />
+                  <span className="text-sm text-gray-700">
+                    <span className="font-semibold text-red-600">{stats.alerts.overdue_invoices}</span> overdue invoice{stats.alerts.overdue_invoices !== 1 ? 's' : ''} totalling {formatCurrency(stats.alerts.overdue_amount || 0)}
+                  </span>
+                </div>
+                <ChevronRight className="w-4 h-4 text-gray-400 group-hover:text-gray-600" />
+              </button>
+            )}
+            {(stats?.alerts?.expiring_leases || 0) > 0 && (
+              <button
+                onClick={() => navigate('/dashboard/leases?status=active&expiring=true')}
+                className="w-full flex items-center justify-between p-3 bg-amber-50 hover:bg-amber-100 rounded-lg transition-colors group"
+              >
+                <div className="flex items-center gap-2">
+                  <Calendar className="w-4 h-4 text-amber-600" />
+                  <span className="text-sm text-gray-700">
+                    <span className="font-semibold text-amber-600">{stats.alerts.expiring_leases}</span> lease{stats.alerts.expiring_leases !== 1 ? 's' : ''} expiring within 30 days
+                  </span>
+                </div>
+                <ChevronRight className="w-4 h-4 text-gray-400 group-hover:text-gray-600" />
+              </button>
+            )}
+          </div>
+        </motion.div>
+      )}
+
+      {/* Aged Receivables & Activity Row */}
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+        {/* Aged Receivables */}
+        <motion.div
+          initial={{ opacity: 0, y: 20 }}
+          animate={{ opacity: 1, y: 0 }}
+          transition={{ delay: 0.42 }}
+          className="bg-white rounded-xl border border-gray-200 p-6 hover:shadow-md transition-shadow duration-300"
+        >
+          <h3 className="text-lg font-semibold text-gray-900 mb-1">Aged Receivables</h3>
+          <p className="text-sm text-gray-500 mb-4">Outstanding invoices by age</p>
+          {isLoading ? (
+            <div className="space-y-3">
+              {[1, 2, 3, 4].map(i => (
+                <div key={i} className="flex items-center gap-3">
+                  <div className="h-4 w-16 bg-gray-200 rounded animate-pulse" />
+                  <div className="flex-1 h-6 bg-gray-200 rounded animate-pulse" />
+                  <div className="h-4 w-20 bg-gray-200 rounded animate-pulse" />
+                </div>
+              ))}
+            </div>
+          ) : (() => {
+            const aged = stats?.aged_receivables || {}
+            const buckets = [
+              { label: 'Current', amount: aged.current || 0, color: 'bg-emerald-500' },
+              { label: '1-30 days', amount: aged.days_30 || 0, color: 'bg-yellow-500' },
+              { label: '31-60 days', amount: aged.days_60 || 0, color: 'bg-orange-500' },
+              { label: '61-90 days', amount: aged.days_90 || 0, color: 'bg-red-500' },
+              { label: '90+ days', amount: aged.days_90_plus || 0, color: 'bg-red-700' },
+            ]
+            const maxAmount = Math.max(...buckets.map(b => b.amount), 1)
+            return (
+              <div className="space-y-3">
+                {buckets.map(bucket => (
+                  <div key={bucket.label} className="flex items-center gap-3">
+                    <span className="text-xs font-medium text-gray-500 w-16 shrink-0">{bucket.label}</span>
+                    <div className="flex-1 bg-gray-100 rounded-full h-6 overflow-hidden">
+                      <motion.div
+                        initial={{ width: 0 }}
+                        animate={{ width: `${Math.max((bucket.amount / maxAmount) * 100, bucket.amount > 0 ? 3 : 0)}%` }}
+                        transition={{ duration: 0.6, delay: 0.1 }}
+                        className={cn('h-full rounded-full', bucket.color)}
+                      />
+                    </div>
+                    <span className="text-xs font-semibold text-gray-700 tabular-nums w-24 text-right">
+                      {formatCurrency(bucket.amount)}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            )
+          })()}
+        </motion.div>
+
+        {/* Activity Feed */}
+        <motion.div
+          initial={{ opacity: 0, y: 20 }}
+          animate={{ opacity: 1, y: 0 }}
+          transition={{ delay: 0.45 }}
+          className="bg-white rounded-xl border border-gray-200 p-6 hover:shadow-md transition-shadow duration-300"
+        >
+          <div className="flex items-center justify-between mb-4">
+            <h3 className="text-lg font-semibold text-gray-900">Recent Activity</h3>
+            <button
+              onClick={() => navigate('/dashboard/audit-trail')}
+              className="text-xs text-primary-600 hover:text-primary-700 font-medium flex items-center gap-1"
+            >
+              View all <ArrowRight className="w-3 h-3" />
+            </button>
+          </div>
+          {isLoading ? (
+            <div className="space-y-4">
+              {[1, 2, 3, 4, 5].map(i => (
+                <div key={i} className="flex gap-3">
+                  <div className="w-8 h-8 bg-gray-200 rounded-full animate-pulse shrink-0" />
+                  <div className="flex-1 space-y-1.5">
+                    <div className="h-3 w-3/4 bg-gray-200 rounded animate-pulse" />
+                    <div className="h-2.5 w-1/3 bg-gray-200 rounded animate-pulse" />
+                  </div>
+                </div>
+              ))}
+            </div>
+          ) : (() => {
+            const activities = stats?.recent_activity || []
+            if (activities.length === 0) {
+              return (
+                <div className="text-center py-8 text-gray-400 text-sm">
+                  <Activity className="w-8 h-8 mx-auto mb-2 opacity-50" />
+                  No recent activity
+                </div>
+              )
+            }
+            const activityIcons: Record<string, { icon: typeof Receipt; color: string; bg: string }> = {
+              receipt: { icon: CreditCard, color: 'text-emerald-600', bg: 'bg-emerald-50' },
+              invoice: { icon: FileText, color: 'text-blue-600', bg: 'bg-blue-50' },
+              lease: { icon: FileText, color: 'text-purple-600', bg: 'bg-purple-50' },
+              tenant: { icon: UserPlus, color: 'text-orange-600', bg: 'bg-orange-50' },
+              expense: { icon: Wallet, color: 'text-red-600', bg: 'bg-red-50' },
+              default: { icon: CheckCircle2, color: 'text-gray-600', bg: 'bg-gray-50' },
+            }
+            return (
+              <div className="space-y-1 max-h-[280px] overflow-y-auto">
+                {activities.slice(0, 8).map((act: any, i: number) => {
+                  const config = activityIcons[act.type] || activityIcons.default
+                  const ActIcon = config.icon
+                  return (
+                    <div key={i} className="flex gap-3 py-2 px-1 rounded-lg hover:bg-gray-50 transition-colors">
+                      <div className={cn('p-1.5 rounded-lg shrink-0', config.bg)}>
+                        <ActIcon className={cn('w-4 h-4', config.color)} />
+                      </div>
+                      <div className="flex-1 min-w-0">
+                        <p className="text-sm text-gray-700 truncate">{act.description}</p>
+                        <p className="text-xs text-gray-500">{act.timestamp ? formatDistanceToNow(act.timestamp) : ''}</p>
+                      </div>
+                    </div>
+                  )
+                })}
+              </div>
+            )
+          })()}
+        </motion.div>
+      </div>
+    </div>
+  )
+}
