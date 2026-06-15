@@ -79,7 +79,7 @@ class PurchaseAgreementViewSet(SoftDeleteMixin, viewsets.ModelViewSet):
         'developer', 'project', 'stand', 'agency', 'agent', 'buyer', 'ownership_profile'
     ).all()
     serializer_class = PurchaseAgreementSerializer
-    filterset_fields = ['status', 'project', 'developer', 'agency', 'agent']
+    filterset_fields = ['status', 'project', 'developer', 'agency', 'agent', 'stand', 'buyer']
     search_fields = ['agreement_number']
     ordering_fields = ['agreement_date', 'sale_price', 'created_at']
 

@@ -1,4 +1,5 @@
 import { ReactNode, useState } from 'react'
+import { Link } from 'react-router-dom'
 import { useQuery, keepPreviousData } from '@tanstack/react-query'
 import { ChevronLeft, ChevronRight } from 'lucide-react'
 import { cn } from '../../lib/utils'
@@ -398,6 +399,42 @@ export function Pagination({
         </button>
       </div>
     </div>
+  )
+}
+
+/** Back link for detail pages. */
+export function BackLink({ to, label }: { to: string; label: string }) {
+  return (
+    <Link to={to} className="inline-flex items-center gap-1 text-sm text-ink-muted transition hover:text-primary-700">
+      <ChevronLeft className="h-4 w-4" /> {label}
+    </Link>
+  )
+}
+
+/** Definition-list metadata grid for detail pages. */
+export function DL({ items }: { items: [string, ReactNode][] }) {
+  return (
+    <dl className="grid grid-cols-2 gap-x-6 gap-y-4 sm:grid-cols-3">
+      {items.map(([k, v], i) => (
+        <div key={i}>
+          <dt className="text-[11px] font-semibold uppercase tracking-wider text-ink-muted">{k}</dt>
+          <dd className="mt-1 text-sm text-ink">{v === null || v === undefined || v === '' ? '—' : v}</dd>
+        </div>
+      ))}
+    </dl>
+  )
+}
+
+/** Section card with a title for detail pages. */
+export function Section({ title, action, children }: { title: string; action?: ReactNode; children: ReactNode }) {
+  return (
+    <Card className="p-6">
+      <div className="mb-4 flex items-center justify-between">
+        <h2 className="text-lg font-bold text-ink">{title}</h2>
+        {action}
+      </div>
+      {children}
+    </Card>
   )
 }
 
