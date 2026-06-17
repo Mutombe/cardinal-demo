@@ -3,6 +3,8 @@ from rest_framework import serializers
 from .models import (
     Developer, DevelopmentProject, Stand, Buyer, Agency, SalesAgent,
     OwnershipProfile, OwnerShare, PurchaseAgreement, Installment, StandPayment, Inquiry,
+    Phase, PriceStep, ConstructionMilestone, BudgetLine, Contractor, SnagItem,
+    TitleTransfer, Reservation, WaitlistEntry,
 )
 
 
@@ -135,3 +137,88 @@ class InquirySerializer(serializers.ModelSerializer):
         read_only_fields = ['created_at']
         # Public submissions only set these; staff manage the rest.
         extra_kwargs = {'status': {'required': False}, 'source': {'required': False}}
+
+
+# --- Developer lifecycle extensions ---------------------------------------
+class PriceStepSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = PriceStep
+        fields = '__all__'
+
+
+class PhaseSerializer(serializers.ModelSerializer):
+    project_name = serializers.CharField(source='project.name', read_only=True)
+    current_price = serializers.DecimalField(max_digits=14, decimal_places=2, read_only=True)
+    stand_count = serializers.IntegerField(read_only=True)
+    price_steps = PriceStepSerializer(many=True, read_only=True)
+
+    class Meta:
+        model = Phase
+        fields = '__all__'
+
+
+class ConstructionMilestoneSerializer(serializers.ModelSerializer):
+    project_name = serializers.CharField(source='project.name', read_only=True)
+
+    class Meta:
+        model = ConstructionMilestone
+        fields = '__all__'
+
+
+class BudgetLineSerializer(serializers.ModelSerializer):
+    project_name = serializers.CharField(source='project.name', read_only=True)
+    variance = serializers.DecimalField(max_digits=16, decimal_places=2, read_only=True)
+
+    class Meta:
+        model = BudgetLine
+        fields = '__all__'
+
+
+class ContractorSerializer(serializers.ModelSerializer):
+    project_name = serializers.CharField(source='project.name', read_only=True)
+    retention_held = serializers.DecimalField(max_digits=16, decimal_places=2, read_only=True)
+    outstanding = serializers.DecimalField(max_digits=16, decimal_places=2, read_only=True)
+
+    class Meta:
+        model = Contractor
+        fields = '__all__'
+
+
+class SnagItemSerializer(serializers.ModelSerializer):
+    stand_number = serializers.CharField(source='stand.stand_number', read_only=True)
+    agreement_number = serializers.CharField(source='agreement.agreement_number', read_only=True)
+
+    class Meta:
+        model = SnagItem
+        fields = '__all__'
+
+
+class TitleTransferSerializer(serializers.ModelSerializer):
+    agreement_number = serializers.CharField(source='agreement.agreement_number', read_only=True)
+    buyer_name = serializers.CharField(source='agreement.buyer.full_name', read_only=True)
+    project_name = serializers.CharField(source='agreement.project.name', read_only=True)
+    stand_number = serializers.CharField(source='agreement.stand.stand_number', read_only=True)
+
+    class Meta:
+        model = TitleTransfer
+        fields = '__all__'
+
+
+class ReservationSerializer(serializers.ModelSerializer):
+    stand_number = serializers.CharField(source='stand.stand_number', read_only=True)
+    project_name = serializers.CharField(source='stand.project.name', read_only=True)
+    seconds_remaining = serializers.IntegerField(read_only=True)
+    is_expired = serializers.BooleanField(read_only=True)
+
+    class Meta:
+        model = Reservation
+        fields = '__all__'
+        read_only_fields = ['reservation_number', 'reserved_at', 'expires_at', 'agreement']
+
+
+class WaitlistEntrySerializer(serializers.ModelSerializer):
+    project_name = serializers.CharField(source='project.name', read_only=True)
+
+    class Meta:
+        model = WaitlistEntry
+        fields = '__all__'

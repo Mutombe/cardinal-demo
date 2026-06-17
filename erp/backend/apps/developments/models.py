@@ -132,6 +132,8 @@ class Stand(SoftDeleteModel):
     code = models.CharField(max_length=30, blank=True)
     stand_number = models.CharField(max_length=50)
     project = models.ForeignKey(DevelopmentProject, on_delete=models.CASCADE, related_name='stands')
+    # Optional release phase (phased developments). String ref — Phase is defined below.
+    phase = models.ForeignKey('Phase', on_delete=models.SET_NULL, null=True, blank=True, related_name='stands')
     size_sqm = models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
     selling_price = models.DecimalField(max_digits=14, decimal_places=2, default=Decimal('0'))
     currency = models.CharField(max_length=10, default='USD')
@@ -578,3 +580,377 @@ class StandPayment(SoftDeleteModel):
         elif self.agreement.status == PurchaseAgreement.Status.DRAFT:
             self.agreement.activate()
         return journal
+
+
+# ===========================================================================
+# Developer lifecycle extensions (ported from Umati): phased releases, price
+# escalation, construction progress, cost control, snagging, title transfer,
+# timed reservations + waitlist. Single-tenant — no company scoping.
+# ===========================================================================
+class Phase(SoftDeleteModel):
+    """A release phase within a development (phased land/stock launches)."""
+    class Status(models.TextChoices):
+        PLANNING = 'planning', 'Planning'
+        SELLING = 'selling', 'Selling'
+        SOLD_OUT = 'sold_out', 'Sold out'
+        COMPLETED = 'completed', 'Completed'
+
+    project = models.ForeignKey(DevelopmentProject, on_delete=models.CASCADE, related_name='phases')
+    name = models.CharField(max_length=120)
+    sequence = models.PositiveIntegerField(default=1)
+    status = models.CharField(max_length=12, choices=Status.choices, default=Status.PLANNING)
+    launch_date = models.DateField(null=True, blank=True)
+    target_completion = models.DateField(null=True, blank=True)
+    notes = models.TextField(blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['project', 'sequence']
+        indexes = [models.Index(fields=['project', 'sequence'])]
+
+    def __str__(self):
+        return f'{self.project.name} · {self.name}'
+
+    @property
+    def current_price(self):
+        step = self.price_steps.filter(is_current=True).order_by('-effective_date', '-id').first()
+        return step.price if step else None
+
+    @property
+    def stand_count(self):
+        return self.stands.count()
+
+
+class PriceStep(models.Model):
+    """One step in a phase's escalating price list. The `is_current` step is the
+    price a new buyer pays today; staff add steps as construction progresses."""
+    phase = models.ForeignKey(Phase, on_delete=models.CASCADE, related_name='price_steps')
+    label = models.CharField(max_length=120, help_text='e.g. Launch, Foundation complete, Roof on')
+    price = models.DecimalField(max_digits=14, decimal_places=2, default=Decimal('0'))
+    effective_date = models.DateField(default=timezone.localdate)
+    is_current = models.BooleanField(default=False)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['phase', 'effective_date', 'id']
+
+    def __str__(self):
+        return f'{self.phase.name} · {self.label} = {self.price}'
+
+    @transaction.atomic
+    def make_current(self):
+        PriceStep.objects.filter(phase=self.phase).update(is_current=False)
+        self.is_current = True
+        self.save(update_fields=['is_current'])
+
+
+class ConstructionMilestone(SoftDeleteModel):
+    """A construction stage for a development with % complete + a progress photo.
+    Feeds a buyer-facing build tracker ('roof on, next: plastering'). Can drip-fund
+    the build by raising a milestone payment on each buyer when the stage completes."""
+    class Status(models.TextChoices):
+        NOT_STARTED = 'not_started', 'Not started'
+        IN_PROGRESS = 'in_progress', 'In progress'
+        COMPLETE = 'complete', 'Complete'
+
+    project = models.ForeignKey(DevelopmentProject, on_delete=models.CASCADE, related_name='milestones')
+    phase = models.CharField(max_length=80, blank=True, help_text='Block / phase, optional')
+    name = models.CharField(max_length=120)
+    sequence = models.PositiveIntegerField(default=1)
+    percent_complete = models.PositiveIntegerField(default=0)
+    status = models.CharField(max_length=12, choices=Status.choices, default=Status.NOT_STARTED, db_index=True)
+    target_date = models.DateField(null=True, blank=True)
+    completed_date = models.DateField(null=True, blank=True)
+    photo = models.ImageField(upload_to='cardinal_construction/', null=True, blank=True)
+    notes = models.TextField(blank=True)
+    # % of each buyer's sale price that falls due when this stage completes.
+    payment_percent = models.DecimalField(max_digits=5, decimal_places=2, default=Decimal('0'))
+    payment_triggered = models.BooleanField(default=False)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['project', 'sequence']
+        indexes = [models.Index(fields=['project', 'sequence'])]
+
+    def __str__(self):
+        return f'{self.project.name} · {self.name}'
+
+    @transaction.atomic
+    def trigger_payments(self):
+        """On completion, raise a payment due (an Installment) for each active buyer
+        in the development = sale_price × payment_percent. Idempotent."""
+        if self.payment_triggered or (self.payment_percent or Decimal('0')) <= 0:
+            return 0
+        count = 0
+        agreements = PurchaseAgreement.objects.filter(
+            project=self.project, status__in=['active', 'draft', 'defaulted'],
+        )
+        for agr in agreements:
+            amount = (agr.sale_price * self.payment_percent / Decimal('100')).quantize(Decimal('0.01'))
+            if amount <= 0:
+                continue
+            num = (agr.installments.aggregate(m=models.Max('number'))['m'] or 0) + 1
+            Installment.objects.create(agreement=agr, number=num,
+                                       due_date=timezone.localdate(), amount=amount)
+            count += 1
+        self.payment_triggered = True
+        self.save(update_fields=['payment_triggered'])
+        return count
+
+
+class BudgetLine(SoftDeleteModel):
+    """A budget vs actual line for a development's build cost."""
+    class Category(models.TextChoices):
+        LAND = 'land', 'Land'
+        CIVILS = 'civils', 'Civils / servicing'
+        CONSTRUCTION = 'construction', 'Construction'
+        PROFESSIONAL = 'professional', 'Professional fees'
+        MARKETING = 'marketing', 'Marketing'
+        FINANCE = 'finance', 'Finance'
+        OTHER = 'other', 'Other'
+
+    project = models.ForeignKey(DevelopmentProject, on_delete=models.CASCADE, related_name='budget_lines')
+    category = models.CharField(max_length=16, choices=Category.choices, default=Category.CONSTRUCTION)
+    name = models.CharField(max_length=160)
+    budgeted_amount = models.DecimalField(max_digits=16, decimal_places=2, default=Decimal('0'))
+    actual_amount = models.DecimalField(max_digits=16, decimal_places=2, default=Decimal('0'))
+    notes = models.TextField(blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['project', 'category', 'id']
+
+    def __str__(self):
+        return f'{self.project.name} · {self.name}'
+
+    @property
+    def variance(self):
+        return (self.budgeted_amount or Decimal('0')) - (self.actual_amount or Decimal('0'))
+
+
+class Contractor(SoftDeleteModel):
+    """A contractor engaged on a development, with retention tracking."""
+    project = models.ForeignKey(DevelopmentProject, on_delete=models.CASCADE, related_name='contractors')
+    name = models.CharField(max_length=200)
+    trade = models.CharField(max_length=120, blank=True)
+    contract_value = models.DecimalField(max_digits=16, decimal_places=2, default=Decimal('0'))
+    retention_percent = models.DecimalField(max_digits=5, decimal_places=2, default=Decimal('10'))
+    paid_to_date = models.DecimalField(max_digits=16, decimal_places=2, default=Decimal('0'))
+    notes = models.TextField(blank=True)
+    is_active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['project', 'name']
+
+    def __str__(self):
+        return f'{self.name} ({self.trade})'
+
+    @property
+    def retention_held(self):
+        return ((self.paid_to_date or Decimal('0')) * (self.retention_percent or Decimal('0')) / Decimal('100')).quantize(Decimal('0.01'))
+
+    @property
+    def outstanding(self):
+        return (self.contract_value or Decimal('0')) - (self.paid_to_date or Decimal('0'))
+
+
+class SnagItem(SoftDeleteModel):
+    """A defect logged at handover, tracked to resolution. Buyer-visible."""
+    class Status(models.TextChoices):
+        OPEN = 'open', 'Open'
+        ASSIGNED = 'assigned', 'Assigned'
+        FIXED = 'fixed', 'Fixed'
+        VERIFIED = 'verified', 'Verified'
+
+    class Severity(models.TextChoices):
+        LOW = 'low', 'Low'
+        MEDIUM = 'medium', 'Medium'
+        HIGH = 'high', 'High'
+
+    agreement = models.ForeignKey(PurchaseAgreement, on_delete=models.CASCADE,
+                                  null=True, blank=True, related_name='snags')
+    stand = models.ForeignKey(Stand, on_delete=models.SET_NULL, null=True, blank=True, related_name='snags')
+    title = models.CharField(max_length=160)
+    description = models.TextField(blank=True)
+    location = models.CharField(max_length=120, blank=True, help_text='e.g. Kitchen, Boundary wall')
+    severity = models.CharField(max_length=8, choices=Severity.choices, default=Severity.MEDIUM)
+    status = models.CharField(max_length=10, choices=Status.choices, default=Status.OPEN, db_index=True)
+    assigned_to = models.CharField(max_length=160, blank=True, help_text='Contractor')
+    photo = models.ImageField(upload_to='cardinal_snags/', null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    resolved_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ['-created_at']
+        indexes = [models.Index(fields=['status'])]
+
+    def __str__(self):
+        return f'{self.title} ({self.status})'
+
+
+class TitleTransfer(SoftDeleteModel):
+    """Title-deed / cession / transfer tracking per agreement. Mirrors the ZW
+    transfer pipeline through to title-deed issue."""
+    class Stage(models.TextChoices):
+        NOT_STARTED = 'not_started', 'Not started'
+        DOCS_PREP = 'docs_prep', 'Documents in preparation'
+        LODGED = 'lodged', 'Lodged at Deeds Office'
+        ASSESSED = 'assessed', 'Assessed'
+        DUTY_PAID = 'duty_paid', 'Transfer duty paid'
+        REGISTERED = 'registered', 'Registered'
+        TITLE_ISSUED = 'title_issued', 'Title deed issued'
+
+    agreement = models.OneToOneField(PurchaseAgreement, on_delete=models.CASCADE, related_name='title_transfer')
+    stand = models.ForeignKey(Stand, on_delete=models.SET_NULL, null=True, blank=True, related_name='+')
+    stage = models.CharField(max_length=14, choices=Stage.choices, default=Stage.NOT_STARTED, db_index=True)
+    deeds_reference = models.CharField(max_length=80, blank=True)
+    conveyancer = models.CharField(max_length=160, blank=True)
+    lodged_date = models.DateField(null=True, blank=True)
+    registered_date = models.DateField(null=True, blank=True)
+    notes = models.TextField(blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['-updated_at', '-id']
+
+    def __str__(self):
+        return f'Transfer {self.agreement.agreement_number} ({self.stage})'
+
+
+class Reservation(SoftDeleteModel):
+    """A timed hold on a stand (deposit-to-reserve) that converts to an agreement."""
+    class Status(models.TextChoices):
+        ACTIVE = 'active', 'Active'
+        EXPIRED = 'expired', 'Expired'
+        CONVERTED = 'converted', 'Converted'
+        CANCELLED = 'cancelled', 'Cancelled'
+
+    reservation_number = models.CharField(max_length=30, unique=True, blank=True)
+    stand = models.ForeignKey(Stand, on_delete=models.CASCADE, related_name='reservations')
+    buyer = models.ForeignKey(Buyer, on_delete=models.SET_NULL, null=True, blank=True, related_name='reservations')
+    buyer_name = models.CharField(max_length=255)
+    buyer_email = models.EmailField(blank=True)
+    buyer_phone = models.CharField(max_length=50, blank=True)
+    deposit_amount = models.DecimalField(max_digits=14, decimal_places=2, default=Decimal('0'))
+    deposit_paid = models.BooleanField(default=False)
+    hold_days = models.PositiveIntegerField(default=7)
+    reserved_at = models.DateTimeField(auto_now_add=True)
+    expires_at = models.DateTimeField()
+    status = models.CharField(max_length=12, choices=Status.choices, default=Status.ACTIVE, db_index=True)
+    source = models.CharField(max_length=40, default='website')
+    agreement = models.ForeignKey('PurchaseAgreement', on_delete=models.SET_NULL, null=True, blank=True, related_name='+')
+    notes = models.TextField(blank=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['-reserved_at', '-id']
+        indexes = [models.Index(fields=['status', 'expires_at'])]
+
+    def __str__(self):
+        return self.reservation_number or f'Reservation #{self.pk}'
+
+    def save(self, *args, **kwargs):
+        if not self.expires_at:
+            self.expires_at = timezone.now() + timezone.timedelta(days=self.hold_days or 7)
+        if not self.reservation_number:
+            with transaction.atomic():
+                prefix = 'RES-'
+                last = Reservation.all_objects.filter(reservation_number__startswith=prefix).order_by('-id').first()
+                n = (last.id if last else 0) + 1
+                self.reservation_number = f'{prefix}{n:04d}'
+        super().save(*args, **kwargs)
+
+    @property
+    def is_expired(self):
+        return self.status == self.Status.ACTIVE and timezone.now() >= self.expires_at
+
+    @property
+    def seconds_remaining(self):
+        if self.status != self.Status.ACTIVE:
+            return 0
+        return max(0, int((self.expires_at - timezone.now()).total_seconds()))
+
+    @transaction.atomic
+    def release(self, reason='expired'):
+        """Free the stand and offer it to the next waitlister."""
+        self.status = self.Status.EXPIRED if reason == 'expired' else self.Status.CANCELLED
+        self.save(update_fields=['status', 'updated_at'])
+        if self.stand_id and self.stand.status == Stand.Status.RESERVED:
+            self.stand.status = Stand.Status.AVAILABLE
+            self.stand.save(update_fields=['status', 'updated_at'])
+        WaitlistEntry.offer_next(self.stand)
+
+    @classmethod
+    def sweep_expired(cls):
+        for r in cls.objects.filter(status=cls.Status.ACTIVE, expires_at__lt=timezone.now()):
+            r.release('expired')
+
+    @transaction.atomic
+    def convert_to_agreement(self, user=None, **agreement_kwargs):
+        """Promote an active reservation into a signed purchase agreement."""
+        if self.agreement_id:
+            return self.agreement
+        buyer = self.buyer
+        if buyer is None:
+            buyer = Buyer.objects.create(full_name=self.buyer_name, email=self.buyer_email,
+                                         phone=self.buyer_phone)
+            self.buyer = buyer
+        stand = self.stand
+        agr = PurchaseAgreement.objects.create(
+            developer=stand.project.developer, project=stand.project, stand=stand, buyer=buyer,
+            sale_price=agreement_kwargs.get('sale_price') or stand.selling_price,
+            deposit_amount=self.deposit_amount,
+            installment_term_months=agreement_kwargs.get('installment_term_months', 0),
+        )
+        self.agreement = agr
+        self.status = self.Status.CONVERTED
+        self.save(update_fields=['agreement', 'status', 'buyer', 'updated_at'])
+        agr.activate(user)  # reserves stand + posts the sale
+        return agr
+
+
+class WaitlistEntry(SoftDeleteModel):
+    """Interested buyers queued on a development/phase; offered a stand when one frees."""
+    class Status(models.TextChoices):
+        WAITING = 'waiting', 'Waiting'
+        OFFERED = 'offered', 'Offered'
+        CONVERTED = 'converted', 'Converted'
+        REMOVED = 'removed', 'Removed'
+
+    phase = models.ForeignKey(Phase, on_delete=models.CASCADE, null=True, blank=True, related_name='waitlist')
+    project = models.ForeignKey(DevelopmentProject, on_delete=models.CASCADE, related_name='waitlist')
+    stand = models.ForeignKey(Stand, on_delete=models.SET_NULL, null=True, blank=True, related_name='+')
+    name = models.CharField(max_length=255)
+    email = models.EmailField(blank=True)
+    phone = models.CharField(max_length=50, blank=True)
+    position = models.PositiveIntegerField(default=1)
+    status = models.CharField(max_length=10, choices=Status.choices, default=Status.WAITING, db_index=True)
+    notes = models.TextField(blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['phase', 'position', 'id']
+
+    def __str__(self):
+        return f'{self.name} — {self.project.name} (#{self.position})'
+
+    @classmethod
+    def offer_next(cls, stand):
+        """When a stand frees up, mark the next waiter on its phase as 'offered'."""
+        if stand is None:
+            return None
+        qs = cls.objects.filter(status=cls.Status.WAITING, project=stand.project)
+        if stand.phase_id:
+            qs = qs.filter(models.Q(phase=stand.phase) | models.Q(phase__isnull=True))
+        nxt = qs.order_by('position', 'id').first()
+        if nxt:
+            nxt.status = cls.Status.OFFERED
+            nxt.stand = stand
+            nxt.save(update_fields=['status', 'stand'])
+        return nxt

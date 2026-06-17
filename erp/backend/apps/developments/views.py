@@ -12,12 +12,17 @@ from apps.soft_delete import SoftDeleteMixin
 from .models import (
     Developer, DevelopmentProject, Stand, Buyer, Agency, SalesAgent,
     OwnershipProfile, PurchaseAgreement, Installment, StandPayment, Inquiry,
+    Phase, PriceStep, ConstructionMilestone, BudgetLine, Contractor, SnagItem,
+    TitleTransfer, Reservation, WaitlistEntry,
 )
 from .serializers import (
     DeveloperSerializer, DevelopmentProjectSerializer, StandSerializer,
     BuyerSerializer, AgencySerializer, SalesAgentSerializer,
     OwnershipProfileSerializer, PurchaseAgreementSerializer,
     InstallmentSerializer, StandPaymentSerializer, InquirySerializer,
+    PhaseSerializer, PriceStepSerializer, ConstructionMilestoneSerializer,
+    BudgetLineSerializer, ContractorSerializer, SnagItemSerializer,
+    TitleTransferSerializer, ReservationSerializer, WaitlistEntrySerializer,
 )
 
 
@@ -345,3 +350,115 @@ class DevelopmentDashboardView(APIView):
             'recent_payments': recent_payments,
             'collection_series': collection_series,
         })
+
+
+# ===========================================================================
+# Developer lifecycle extension viewsets (ported from Umati)
+# ===========================================================================
+class PhaseViewSet(SoftDeleteMixin, viewsets.ModelViewSet):
+    queryset = Phase.objects.select_related('project').prefetch_related('price_steps').all()
+    serializer_class = PhaseSerializer
+    filterset_fields = ['project', 'status']
+    search_fields = ['name']
+    ordering_fields = ['sequence', 'created_at']
+
+
+class PriceStepViewSet(viewsets.ModelViewSet):
+    queryset = PriceStep.objects.select_related('phase').all()
+    serializer_class = PriceStepSerializer
+    filterset_fields = ['phase', 'is_current']
+
+    @action(detail=True, methods=['post'])
+    def make_current(self, request, pk=None):
+        step = self.get_object()
+        step.make_current()
+        return Response(self.get_serializer(step).data)
+
+
+class ConstructionMilestoneViewSet(SoftDeleteMixin, viewsets.ModelViewSet):
+    queryset = ConstructionMilestone.objects.select_related('project').all()
+    serializer_class = ConstructionMilestoneSerializer
+    filterset_fields = ['project', 'status']
+    ordering_fields = ['sequence', 'target_date', 'created_at']
+
+    @action(detail=True, methods=['post'])
+    def trigger_payments(self, request, pk=None):
+        """Mark complete and raise the milestone payment on every active buyer."""
+        m = self.get_object()
+        m.status = ConstructionMilestone.Status.COMPLETE
+        m.percent_complete = 100
+        if not m.completed_date:
+            m.completed_date = timezone.localdate()
+        m.save(update_fields=['status', 'percent_complete', 'completed_date'])
+        raised = m.trigger_payments()
+        data = self.get_serializer(m).data
+        data['payments_raised'] = raised
+        return Response(data)
+
+
+class BudgetLineViewSet(SoftDeleteMixin, viewsets.ModelViewSet):
+    queryset = BudgetLine.objects.select_related('project').all()
+    serializer_class = BudgetLineSerializer
+    filterset_fields = ['project', 'category']
+
+
+class ContractorViewSet(SoftDeleteMixin, viewsets.ModelViewSet):
+    queryset = Contractor.objects.select_related('project').all()
+    serializer_class = ContractorSerializer
+    filterset_fields = ['project', 'is_active']
+    search_fields = ['name', 'trade']
+
+
+class SnagItemViewSet(SoftDeleteMixin, viewsets.ModelViewSet):
+    queryset = SnagItem.objects.select_related('stand', 'agreement').all()
+    serializer_class = SnagItemSerializer
+    filterset_fields = ['status', 'severity', 'stand', 'agreement']
+    search_fields = ['title', 'location', 'assigned_to']
+    ordering_fields = ['created_at', 'severity', 'status']
+
+
+class TitleTransferViewSet(SoftDeleteMixin, viewsets.ModelViewSet):
+    queryset = TitleTransfer.objects.select_related('agreement', 'agreement__buyer', 'agreement__project', 'agreement__stand').all()
+    serializer_class = TitleTransferSerializer
+    filterset_fields = ['stage', 'agreement']
+    search_fields = ['deeds_reference', 'conveyancer']
+    ordering_fields = ['updated_at', 'lodged_date', 'registered_date']
+
+
+class ReservationViewSet(SoftDeleteMixin, viewsets.ModelViewSet):
+    queryset = Reservation.objects.select_related('stand', 'stand__project', 'buyer').all()
+    serializer_class = ReservationSerializer
+    filterset_fields = ['status', 'stand', 'source']
+    search_fields = ['reservation_number', 'buyer_name', 'buyer_email']
+    ordering_fields = ['reserved_at', 'expires_at']
+
+    def perform_create(self, serializer):
+        # New reservation reserves the stand (if available).
+        res = serializer.save()
+        if res.stand_id and res.stand.status == Stand.Status.AVAILABLE:
+            res.stand.status = Stand.Status.RESERVED
+            res.stand.save(update_fields=['status', 'updated_at'])
+
+    @action(detail=True, methods=['post'])
+    def convert(self, request, pk=None):
+        res = self.get_object()
+        agr = res.convert_to_agreement(
+            user=request.user if request.user.is_authenticated else None,
+            sale_price=request.data.get('sale_price'),
+            installment_term_months=int(request.data.get('installment_term_months', 0) or 0),
+        )
+        from .serializers import PurchaseAgreementSerializer
+        return Response(PurchaseAgreementSerializer(agr).data)
+
+    @action(detail=True, methods=['post'])
+    def release(self, request, pk=None):
+        res = self.get_object()
+        res.release(reason=request.data.get('reason', 'cancelled'))
+        return Response(self.get_serializer(res).data)
+
+
+class WaitlistEntryViewSet(SoftDeleteMixin, viewsets.ModelViewSet):
+    queryset = WaitlistEntry.objects.select_related('project', 'phase').all()
+    serializer_class = WaitlistEntrySerializer
+    filterset_fields = ['project', 'phase', 'status']
+    search_fields = ['name', 'email', 'phone']
